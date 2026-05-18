@@ -1,0 +1,3 @@
+[submodule "gnu-units-sys/vendor/units"]
+	path = gnu-units-sys/vendor/units
+	url = https://salsa.debian.org/debian/units.git

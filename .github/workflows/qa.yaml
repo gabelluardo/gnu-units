@@ -1,0 +1,65 @@
+name: QA & sanity checks
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+
+permissions:
+    contents: read
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
+env:
+    CARGO_TERM_COLOR: always
+    RUST_LOG: info
+    RUST_BACKTRACE: 1
+
+jobs:
+    rust-sanity:
+        name: "Rust: Code sanity"
+        runs-on: ubuntu-latest
+        steps:
+            - uses: canonical/desktop-engineering/gh-actions/common/dpkg-install-speedup@main
+            - uses: actions/checkout@v4
+              with:
+                  token: ${{ github.token }}
+                  submodules: true
+            - name: Rust code sanity check
+              uses: canonical/desktop-engineering/gh-actions/rust/code-sanity@main
+              with:
+                  token: ${{ github.token }}
+
+    rust-tests:
+        name: "Rust: Tests and coverage"
+        runs-on: ubuntu-latest
+        steps:
+            - uses: canonical/desktop-engineering/gh-actions/common/dpkg-install-speedup@main
+            - uses: actions/checkout@v4
+              with:
+                  token: ${{ github.token }}
+                  submodules: true
+            - name: Install nextest and cargo-llvm-cov
+              uses: taiki-e/install-action@v2
+              with:
+                  tool: nextest,cargo-llvm-cov
+            - name: Install Rust stable toolchain
+              run: rustup update stable
+            - name: Run tests
+              run: cargo nextest run --workspace
+            - name: Collect coverage
+              run: |
+                  cargo llvm-cov nextest \
+                    --workspace \
+                    --ignore-filename-regex "_test\.rs$" \
+                    --lcov \
+                    --output-path lcov.info
+            # Codecov upload is currently disabled as the project is private.
+            #- name: Upload coverage to Codecov
+            #  uses: codecov/codecov-action@v5
+            #  with:
+            #      token: ${{ secrets.CODECOV_TOKEN }}
+            #      files: lcov.info
+            #      fail_ci_if_error: false

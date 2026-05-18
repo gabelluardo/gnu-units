@@ -1,0 +1,44 @@
+[workspace]
+members = [".", "gnu-units-sys"]
+
+[package]
+name = "gnu-units"
+version = "0.1.0"
+authors = ["Gabriele Belluardo <gabriele.belluardo@outlook.it>"]
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "Safe Rust bindings for the GNU units conversion"
+homepage = "https://github.com/gabelluardo/gnu-units"
+repository = "https://github.com/gabelluardo/gnu-units"
+documentation = "https://docs.rs/gnu-units"
+readme = "README.md"
+categories = ["api-bindings", "mathematics"]
+keywords = ["gnu", "units", "conversion", "physics", "currency"]
+
+[features]
+default = ["gnu-units-sys/default"]
+
+# Build and statically link to vendored units sources.
+vendored = ["gnu-units-sys/vendored"]
+
+# Regenerate checked-in FFI bindings.
+bindgen = ["gnu-units-sys/bindgen"]
+
+# Enable Rust-native emulation of units_cur currency update logic.
+currency-update = ["dep:reqwest", "dep:serde", "dep:serde_json", "dep:chrono"]
+
+[dependencies]
+gnu-units-sys = { version = "2.27", path = "gnu-units-sys", default-features = false }
+reqwest = { version = "0.13", default-features = false, features = [
+    "blocking",
+    "json",
+    "rustls",
+], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+chrono = { version = "0.4", default-features = false, features = [
+    "clock",
+], optional = true }
+
+[dev-dependencies]
+rstest = "0.26"

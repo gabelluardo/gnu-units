@@ -1,0 +1,53 @@
+[package]
+name = "gnu-units-sys"
+version = "2.27.0"
+authors = ["Gabriele Belluardo <gabriele.belluardo@outlook.it>"]
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "Raw FFI bindings to the GNU units C library"
+homepage = "https://github.com/gabelluardo/gnu-units"
+repository = "https://github.com/gabelluardo/gnu-units"
+documentation = "https://docs.rs/gnu-units-sys"
+readme = "../README.md"
+categories = ["external-ffi-bindings"]
+keywords = ["gnu", "units", "ffi", "sys", "bindings"]
+build = "build.rs"
+include = [
+    "src/**",
+    "gen/**",
+    "build.rs",
+    "wrapper.h",
+    "Cargo.toml",
+    "vendor/units/units.c",
+    "vendor/units/units.h",
+    "vendor/units/parse.tab.c",
+    "vendor/units/parse.y",
+    "vendor/units/getopt.c",
+    "vendor/units/getopt.h",
+    "vendor/units/getopt1.c",
+    "vendor/units/strfunc.c",
+    "vendor/units/definitions.units",
+    "vendor/units/elements.units",
+    "vendor/units/currency.units",
+    "vendor/units/crypto.units",
+    "vendor/units/metal_prices.units",
+    "vendor/units/cpi.units",
+    "vendor/units/COPYING",
+]
+
+[dependencies]
+
+[features]
+default = ["vendored"]
+
+# Build and statically link to vendored GNU units sources.
+vendored = ["dep:cc"]
+
+# Regenerate bindings only when requested by FFI maintainers.
+bindgen = ["dep:bindgen", "vendored"]
+
+[build-dependencies]
+bindgen = { version = "0.72", default-features = false, features = [
+    "runtime",
+], optional = true }
+cc = { version = "1", features = ["parallel"], optional = true }
