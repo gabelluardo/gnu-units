@@ -44,6 +44,7 @@ fn generate_bindings() {
         .allowlist_function("unit2num")
         .allowlist_function("evalfunc")
         .allowlist_function("fnlookup")
+        .allowlist_function("completereduce")
         .allowlist_function("addunit")
         .allowlist_function("multunit")
         .allowlist_function("divunit")

@@ -514,6 +514,9 @@ unsafe extern "C" {
     pub static mut utf8mode: ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+    pub fn completereduce(unit: *mut unittype) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn newunit(
         unitname: *mut ::std::os::raw::c_char,
         unitdef: *mut ::std::os::raw::c_char,

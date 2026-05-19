@@ -805,6 +805,82 @@ pub fn convert(from: &str, to: &str) -> Result<f64> {
     Unit::parse(from)?.convert_to(Unit::parse(to)?)
 }
 
+/// Converts `from` to `to`, supporting function-based targets (e.g. `tempF`).
+///
+/// This mirrors the GNU units CLI behavior: if `to` names a registered
+/// function (like a temperature scale), the function's inverse is applied
+/// to the parsed `from` value. Otherwise, a normal dimensional conversion
+/// is performed.
+///
+/// # Errors
+///
+/// Returns `Err(UnitsError)` when parsing fails, dimensions are incompatible,
+/// or the function inverse cannot be evaluated.
+pub fn convert_with_functions(from: &str, to: &str) -> Result<f64> {
+    ensure_db();
+    let _guard = FFI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let c_to = CString::new(to).map_err(|_| UnitsError {
+        code: gnu_units_sys::E_PARSE as c_int,
+    })?;
+
+    // Check if `to` is a function name.
+    // SAFETY: c_to is a valid NUL-terminated C string. fnlookup only reads
+    // the string and looks up the function hash table. FFI_LOCK is held.
+    let func_ptr = unsafe { gnu_units_sys::fnlookup(c_to.as_ptr()) };
+    if func_ptr.is_null() {
+        return Unit::parse(from)?.convert_to(Unit::parse(to)?);
+    }
+
+    // Function target: parse `from`, then apply the inverse function.
+    let c_from = CString::new(from).map_err(|_| UnitsError {
+        code: gnu_units_sys::E_PARSE as c_int,
+    })?;
+
+    let mut unit = Unit::new();
+    // SAFETY: unit is freshly initialized via new(). c_from is a valid
+    // NUL-terminated C string. parseunit writes into unit without reading
+    // uninitialized data. FFI_LOCK is held.
+    let code = unsafe {
+        gnu_units_sys::parseunit(
+            unit.as_mut_ptr(),
+            c_from.as_ptr(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    if let Some(err) = UnitsError::from_code(code) {
+        return Err(err);
+    }
+
+    // SAFETY: unit_ptr points to unit.raw. evalfunc accesses the unit
+    // through theunitlist[0], may call freeunit+initializeunit+multunit
+    // on it. freeunit nulls the array terminators, so Rust's Drop is
+    // safe (idempotent). FFI_LOCK is held for the entire duration.
+    let mut unit_ptr = unsafe { unit.as_mut_ptr() };
+    let code = unsafe {
+        gnu_units_sys::evalfunc(
+            1,             // param_count
+            &mut unit_ptr, // theunitlist
+            func_ptr,      // infunc
+            1,             // inverse = true
+            0,             // allerror = normal
+        )
+    };
+    if let Some(err) = UnitsError::from_code(code) {
+        return Err(err);
+    }
+
+    // SAFETY: unit.raw is in a valid state after evalfunc. completereduce
+    // gracefully handles empty dimension arrays. FFI_LOCK is held.
+    let code = unsafe { gnu_units_sys::completereduce(unit.as_mut_ptr()) };
+    if let Some(err) = UnitsError::from_code(code) {
+        return Err(err);
+    }
+
+    Ok(unit.factor())
+}
+
 /// Finds all unit definitions that are conformable with `expr`.
 ///
 /// Parses `expr` into a [`Unit`], then iterates over every

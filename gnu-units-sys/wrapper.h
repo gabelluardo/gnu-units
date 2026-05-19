@@ -5,6 +5,8 @@ extern char *mylocale;
 extern char *progname;
 extern int utf8mode;
 
+int completereduce(struct unittype *unit);
+
 int newunit(char *unitname, char *unitdef, int *count, int linenum,
             char *file, FILE *errfile, int redefine, int userunit);
 
