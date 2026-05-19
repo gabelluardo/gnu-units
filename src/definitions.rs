@@ -1,7 +1,8 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::os::raw::c_int;
+use std::sync::{LazyLock, Mutex};
 
 pub(crate) static DEFINITIONS: &str =
     include_str!("../gnu-units-sys/vendor/units/definitions.units");
@@ -116,13 +117,26 @@ fn lookup_var(name: &str, env: &HashMap<String, String>) -> Option<String> {
     env.get(name).cloned().or_else(|| std::env::var(name).ok())
 }
 
+static FILE_PTRS: LazyLock<Mutex<HashMap<Vec<u8>, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn intern_filename(filename: &CStr) -> *mut std::os::raw::c_char {
+    let key = filename.to_bytes().to_vec();
+    let mut map = FILE_PTRS.lock().unwrap();
+    let addr = *map
+        .entry(key)
+        .or_insert_with(|| CString::new(filename.to_bytes()).unwrap().into_raw() as usize);
+    addr as *mut std::os::raw::c_char
+}
+
 fn load_definitions_inner(
     content: &str,
     filename: &std::ffi::CStr,
     env: &mut HashMap<String, String>,
 ) -> Vec<Definition> {
-    // SAFETY: file_ptr is leaked so the C library can store it permanently.
-    let file_ptr = CString::new(filename.to_bytes()).unwrap().into_raw();
+    // SAFETY: each unique filename CString is leaked once, giving the C library
+    // a stable pointer it can retain for the process lifetime.
+    let file_ptr = intern_filename(filename);
 
     let mut results: Vec<Definition> = Vec::new();
     let mut wrong_locale = false;
@@ -296,11 +310,8 @@ fn load_definitions_inner(
             continue;
         }
 
-        let (name, redefine) = if let Some(stripped) = raw_name.strip_prefix('+') {
-            (stripped, 1)
-        } else {
-            (raw_name, 0)
-        };
+        let name = raw_name.strip_prefix('+').unwrap_or(raw_name);
+        let redefine = 1;
 
         if name.is_empty() {
             continue;

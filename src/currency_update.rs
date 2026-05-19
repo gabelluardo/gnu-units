@@ -1,7 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::fs;
-use std::path::Path;
 
 use chrono::Utc;
 use reqwest::blocking::Client;
@@ -11,7 +9,7 @@ use serde::Deserialize;
 ///
 /// Choose a source based on your requirements for API-key usage and supported base
 /// currencies. Pass the chosen variant through [`CurrencyUpdateOptions::source`] when
-/// calling [`update_currency_file`].
+/// calling [`fetch_currency_updates`].
 ///
 /// # Examples
 ///
@@ -36,6 +34,11 @@ pub enum CurrencySource {
     /// inverse rates are reported relative to that base. [`CurrencyUpdateOptions::api_key`]
     /// is ignored when this variant is selected.
     Floatrates,
+    /// `Ecb` fetches rates from the [European Central Bank](https://www.ecb.europa.eu).
+    ///
+    /// No API key is required. The base currency is always EUR regardless of
+    /// [`CurrencyUpdateOptions::base`]. [`CurrencyUpdateOptions::api_key`] is ignored.
+    Ecb,
 }
 
 impl CurrencySource {
@@ -43,6 +46,7 @@ impl CurrencySource {
         match self {
             Self::ExchangerateApi => "exchangerate-api.com",
             Self::Floatrates => "floatrates.com",
+            Self::Ecb => "ecb.europa.eu",
         }
     }
 }
@@ -201,11 +205,11 @@ struct TemplateData {
     existing_definitions: HashMap<String, String>,
 }
 
-/// `update_currency_file` fetches live exchange rates and writes a GNU units currency file to `path`.
+/// Fetches live exchange rates and returns the rendered GNU units currency
+/// file content as a `String`, without writing to disk.
 ///
-/// The function reads the bundled `currency.units` template shipped with the GNU units data
-/// files, queries the provider configured in `opts` for current rates keyed to `opts.base`,
-/// renders the result, and overwrites `path` with the updated file.
+/// Use this together with [`reload_currency`](crate::reload_currency) when you
+/// want to update rates in memory without any filesystem I/O.
 ///
 /// # Errors
 ///
@@ -217,37 +221,23 @@ struct TemplateData {
 /// * [`UpdateError::Json`] — the provider response could not be deserialised.
 /// * [`UpdateError::Provider`] — the provider returned a logical error (e.g. invalid API
 ///   key, unsupported base currency).
-/// * [`UpdateError::Io`] — writing the output file failed.
-///
-/// # Examples
-///
-/// ```no_run
-/// use std::path::Path;
-/// use gnu_units::currency_update::{update_currency_file, CurrencySource, CurrencyUpdateOptions};
-///
-/// # fn main() -> gnu_units::currency_update::Result<()> {
-/// let opts = CurrencyUpdateOptions {
-///     source: CurrencySource::Floatrates,
-///     base: "USD",
-///     api_key: None,
-/// };
-/// update_currency_file(Path::new("/tmp/currency.units"), &opts)?;
-/// # Ok(())
-/// # }
-/// ```
-pub fn update_currency_file(path: &Path, opts: &CurrencyUpdateOptions<'_>) -> Result<()> {
+pub fn fetch_currency_updates(opts: &CurrencyUpdateOptions<'_>) -> Result<String> {
     use crate::definitions::CURRENCY_UNITS;
 
-    let template = parse_template(CURRENCY_UNITS)?;
     let base = opts.base.to_ascii_uppercase();
+    if matches!(opts.source, CurrencySource::Ecb) && base != "EUR" {
+        return Err(UpdateError::Provider(
+            "ECB source only supports EUR as base currency".to_string(),
+        ));
+    }
+
+    let template = parse_template(CURRENCY_UNITS)?;
     let rates = fetch_rates(opts.source, &base, opts.api_key)?;
     let today = Utc::now().date_naive().format("%Y-%m-%d").to_string();
-    let out = render_currency_file(&template, &rates, &base, opts.source.label(), &today)?;
-    fs::write(path, out)?;
-    Ok(())
+    build_currency_template(&template, &rates, &base, opts.source.label(), &today)
 }
 
-fn render_currency_file(
+fn build_currency_template(
     template: &TemplateData,
     rates: &HashMap<String, f64>,
     base: &str,
@@ -281,7 +271,9 @@ fn render_currency_file(
     }
 
     for (code, unit_name) in &template.code_to_unit {
-        if let Some(def) = ordered_updates.get(code) {
+        if code == base {
+            out.push_str(&format!("{:<26} !\n", unit_name));
+        } else if let Some(def) = ordered_updates.get(code) {
             out.push_str(&format!("{:<26} {}\n", unit_name, def));
         } else if let Some(existing) = template.existing_definitions.get(unit_name) {
             out.push_str(&format!("{:<26} {}\n", unit_name, existing));
@@ -364,11 +356,56 @@ fn fetch_rates(
     base: &str,
     api_key: Option<&str>,
 ) -> Result<HashMap<String, f64>> {
-    let client = Client::builder().build()?;
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
     match source {
         CurrencySource::ExchangerateApi => fetch_exchangerate_api(&client, base, api_key),
         CurrencySource::Floatrates => fetch_floatrates(&client, base),
+        CurrencySource::Ecb => fetch_ecb(&client),
     }
+}
+
+fn fetch_ecb(client: &Client) -> Result<HashMap<String, f64>> {
+    fn parse_xml_attr<'a>(text: &'a str, attr: &str) -> Option<&'a str> {
+        for quote in ['"', '\''] {
+            let needle = format!("{attr}={quote}");
+            if let Some(start) = text.find(&needle) {
+                let after = &text[start + needle.len()..];
+                if let Some(end) = after.find(quote) {
+                    return Some(&after[..end]);
+                }
+            }
+        }
+        None
+    }
+
+    let url = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml";
+    let text = client.get(url).send()?.error_for_status()?.text()?;
+
+    let mut rates = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.contains("currency=") {
+            continue;
+        }
+        if let (Some(code), Some(rate_str)) = (
+            parse_xml_attr(line, "currency"),
+            parse_xml_attr(line, "rate"),
+        ) && let Ok(rate) = rate_str.parse::<f64>()
+        {
+            rates.insert(code.to_string(), rate);
+        }
+    }
+
+    if rates.is_empty() {
+        return Err(UpdateError::Provider(
+            "ECB feed returned no rates".to_string(),
+        ));
+    }
+
+    rates.insert("EUR".to_string(), 1.0);
+    Ok(rates)
 }
 
 #[derive(Debug, Deserialize)]
@@ -432,8 +469,7 @@ fn fetch_exchangerate_api(
 #[derive(Debug, Deserialize)]
 struct FloatRateEntry {
     code: String,
-    #[serde(rename = "inverseRate")]
-    inverse_rate: f64,
+    rate: f64,
 }
 
 fn parse_floatrates_response(
@@ -442,7 +478,7 @@ fn parse_floatrates_response(
 ) -> HashMap<String, f64> {
     let mut out = HashMap::new();
     for entry in map.values() {
-        out.insert(entry.code.to_ascii_uppercase(), entry.inverse_rate);
+        out.insert(entry.code.to_ascii_uppercase(), entry.rate);
     }
     out.insert(base.to_string(), 1.0);
     out
@@ -727,7 +763,7 @@ mod tests {
         rates.insert("EUR".to_string(), 0.92);
         rates.insert("GBP".to_string(), 0.79);
 
-        let result = render_currency_file(
+        let result = build_currency_template(
             &template,
             &rates,
             "USD",
@@ -743,6 +779,7 @@ mod tests {
             "\n",
             "!message Currency exchange rates from exchangerate-api.com (USD base) on 2024-01-15\n",
             "\n",
+            "dollar                     !\n",
             "euro                       1|0.92 dollar\n",
             "poundsterling              1|0.79 dollar\n",
         );
@@ -758,7 +795,7 @@ mod tests {
         let mut rates = HashMap::new();
         rates.insert("EUR".to_string(), 0.92);
 
-        let result = render_currency_file(
+        let result = build_currency_template(
             &template,
             &rates,
             "USD",
@@ -774,6 +811,7 @@ mod tests {
             "\n",
             "!message Currency exchange rates from exchangerate-api.com (USD base) on 2024-01-15\n",
             "\n",
+            "dollar                     !\n",
             "euro                       1|0.92 dollar\n",
             "poundsterling              1|0.8 dollar\n",
         );
@@ -785,7 +823,7 @@ mod tests {
         let template = make_template(vec![("USD", "dollar"), ("EUR", "euro")], vec![]);
         let rates = HashMap::new();
 
-        let result = render_currency_file(&template, &rates, "XXX", "test", "2024-01-15");
+        let result = build_currency_template(&template, &rates, "XXX", "test", "2024-01-15");
 
         assert!(matches!(result, Err(UpdateError::Provider(_))));
     }
@@ -801,7 +839,8 @@ mod tests {
         rates.insert("GBP".to_string(), 0.79);
         rates.insert("EUR".to_string(), 0.92);
 
-        let result = render_currency_file(&template, &rates, "USD", "test", "2024-01-15").unwrap();
+        let result =
+            build_currency_template(&template, &rates, "USD", "test", "2024-01-15").unwrap();
 
         let expected = concat!(
             "# Sample prelude\n",
@@ -810,6 +849,7 @@ mod tests {
             "\n",
             "!message Currency exchange rates from test (USD base) on 2024-01-15\n",
             "\n",
+            "dollar                     !\n",
             "euro                       1|0.92 dollar\n",
             "poundsterling              1|0.79 dollar\n",
         );
@@ -831,7 +871,8 @@ mod tests {
         let mut rates = HashMap::new();
         rates.insert("EUR".to_string(), 0.92);
 
-        let result = render_currency_file(&template, &rates, "USD", "test", "2024-01-15").unwrap();
+        let result =
+            build_currency_template(&template, &rates, "USD", "test", "2024-01-15").unwrap();
 
         let expected = concat!(
             "# Sample prelude\n",
@@ -840,6 +881,7 @@ mod tests {
             "\n",
             "!message Currency exchange rates from test (USD base) on 2024-01-15\n",
             "\n",
+            "dollar                     !\n",
             "euro                       1|0.92 dollar\n",
         );
         assert_eq!(result, expected);
@@ -955,14 +997,14 @@ mod tests {
             "eur".to_string(),
             FloatRateEntry {
                 code: "eur".to_string(),
-                inverse_rate: 0.92,
+                rate: 0.92,
             },
         );
         map.insert(
             "gbp".to_string(),
             FloatRateEntry {
                 code: "gbp".to_string(),
-                inverse_rate: 0.79,
+                rate: 0.79,
             },
         );
 

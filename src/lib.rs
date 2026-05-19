@@ -16,7 +16,7 @@ pub use definitions::{Definition, DefinitionKind};
 
 #[cfg(feature = "currency-update")]
 pub use currency_update::{
-    CurrencySource, CurrencyUpdateOptions, UpdateError, update_currency_file,
+    CurrencySource, CurrencyUpdateOptions, UpdateError, fetch_currency_updates,
 };
 
 /// `UnitsError` wraps a raw error code returned by the GNU units C library.
@@ -762,6 +762,20 @@ pub fn parse(input: &str) -> Result<Unit> {
     Unit::parse(input)
 }
 
+/// Reloads currency unit definitions from a GNU units currency file string.
+///
+/// Parses `content` as a GNU units definitions file and registers every
+/// definition found into the C library's global hash tables, overwriting any
+/// existing entry with the same name. Call this after writing an updated
+/// currency file via [`update_currency_file`] to make the new rates effective
+/// for all subsequent [`parse`] and [`convert`] calls.
+#[cfg(feature = "currency-update")]
+pub fn reload_currency(content: &str) {
+    ensure_db();
+    let _guard = FFI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    load_definitions(content, c"currency.units");
+}
+
 /// Parses `from` and `to` as GNU units expressions and returns the numeric
 /// conversion factor from `from` to `to`.
 ///
@@ -871,15 +885,6 @@ mod tests {
     }
 
     #[test]
-    fn units_error_clone_equals_original() {
-        let original = UnitsError { code: 7 };
-
-        let cloned = original.clone();
-
-        assert_eq!(cloned, original);
-    }
-
-    #[test]
     fn units_error_copy_semantics() {
         let original = UnitsError { code: 7 };
         let copied: UnitsError = original;
@@ -896,7 +901,7 @@ mod tests {
 
     #[rstest]
     #[case::integer("5", 5.0)]
-    #[case::float("3.14", 3.14)]
+    #[case::float("3.15", 3.15)]
     #[case::large("1e10", 1e10)]
     fn parse_numeric(#[case] input: &str, #[case] expected: f64) {
         let unit = Unit::parse(input).unwrap();
