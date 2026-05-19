@@ -1,9 +1,8 @@
-use std::ffi::{CStr, CString};
+use std::ffi::CStr;
 use std::fmt;
 use std::mem::MaybeUninit;
 use std::os::raw::c_int;
-use std::ptr;
-use std::sync::{LazyLock, Mutex};
+use std::sync::LazyLock;
 
 pub use gnu_units_sys;
 
@@ -11,6 +10,8 @@ pub use gnu_units_sys;
 pub mod currency_update;
 
 mod definitions;
+mod ffi;
+
 use definitions::{DEFINITIONS, load_definitions};
 pub use definitions::{Definition, DefinitionKind};
 
@@ -136,12 +137,12 @@ pub type Result<T> = std::result::Result<T, UnitsError>;
 /// # }
 /// ```
 pub struct Unit {
-    raw: gnu_units_sys::unittype,
+    pub(crate) raw: gnu_units_sys::unittype,
 }
 
 // SAFETY: All FFI calls that read or mutate `unittype` fields are serialized
-// through `FFI_LOCK`. The raw pointers inside `unittype` point to C heap
-// allocations that are only accessed under the same lock.
+// through `MUTEX` in `ffi.rs`. The raw pointers inside `unittype` point to
+// C heap allocations that are only accessed under the same lock.
 unsafe impl Send for Unit {}
 unsafe impl Sync for Unit {}
 
@@ -154,10 +155,11 @@ unsafe impl Sync for Unit {}
 /// accesses are no-ops, the `LazyLock` guarantees the closure runs at most
 /// once, even under concurrent access.
 static DB: LazyLock<Vec<Definition>> = LazyLock::new(|| {
-    let _guard = FFI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: mylocale/progname point to static C strings that live for the
-    // duration of the process. utf8mode is a plain C int. All writes happen
-    // under FFI_LOCK before any other FFI call can observe the globals.
+    // duration of the process. utf8mode is a plain C int. LazyLock guarantees
+    // this closure runs at most once, so no other FFI call can observe the
+    // globals mid-write.
+    let _guard = ffi::lock();
     unsafe {
         gnu_units_sys::mylocale = c"en_US".as_ptr() as *mut std::os::raw::c_char;
         gnu_units_sys::progname = c"gnu-units".as_ptr() as *mut std::os::raw::c_char;
@@ -175,13 +177,6 @@ static DB: LazyLock<Vec<Definition>> = LazyLock::new(|| {
     defs.sort_by(|a, b| a.name.cmp(&b.name));
     defs
 });
-
-/// Global mutex that serializes every FFI call into the GNU units C library.
-///
-/// The C library uses process-wide mutable globals (e.g. `unitcount`,
-/// `lastunitset`, `lastunit`, `parameter_value`). Every call site that
-/// touches those globals must hold this lock for the duration of the call.
-static FFI_LOCK: Mutex<()> = Mutex::new(());
 
 /// Ensures the GNU units database is loaded exactly once.
 ///
@@ -254,31 +249,7 @@ impl Unit {
     /// ```
     pub fn parse(input: &str) -> Result<Self> {
         ensure_db();
-
-        let c_input = CString::new(input).map_err(|_| UnitsError {
-            code: gnu_units_sys::E_PARSE as c_int,
-        })?;
-
-        let mut unit = Self::new();
-        let _guard = FFI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: unit is freshly initialized via new(). c_input is a valid
-        // NUL-terminated C string. parseunit writes into unit without
-        // reading uninitialised data. The null pointers for errstr/errloc
-        // are accepted by parseunit (optional out-params). FFI_LOCK is held.
-        let code = unsafe {
-            gnu_units_sys::parseunit(
-                unit.as_mut_ptr(),
-                c_input.as_ptr(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-            )
-        };
-
-        if let Some(err) = UnitsError::from_code(code) {
-            return Err(err);
-        }
-
-        Ok(unit)
+        ffi::parseunit(input)
     }
 
     /// Multiplies `self` by `rhs` in place, consuming `rhs`.
@@ -307,11 +278,7 @@ impl Unit {
     /// # }
     /// ```
     pub fn multiply(&mut self, mut rhs: Unit) -> Result<()> {
-        // SAFETY: self and rhs are valid initialized units. multunit moves
-        // pointer ownership from rhs to self via moveproduct, which sets
-        // source entries to NULLUNIT, no global state is accessed.
-        let code = unsafe { gnu_units_sys::multunit(self.as_mut_ptr(), rhs.as_mut_ptr()) };
-        UnitsError::from_code(code).map_or(Ok(()), Err)
+        ffi::multunit(self, &mut rhs)
     }
 
     /// Divides `self` by `rhs` in place, consuming `rhs`.
@@ -340,11 +307,7 @@ impl Unit {
     /// # }
     /// ```
     pub fn divide(&mut self, mut rhs: Unit) -> Result<()> {
-        // SAFETY: self and rhs are valid initialized units. divunit moves
-        // pointer ownership from rhs to self via moveproduct, which sets
-        // source entries to NULLUNIT, no global state is accessed.
-        let code = unsafe { gnu_units_sys::divunit(self.as_mut_ptr(), rhs.as_mut_ptr()) };
-        UnitsError::from_code(code).map_or(Ok(()), Err)
+        ffi::divunit(self, &mut rhs)
     }
 
     /// Adds `rhs` to `self` in place, consuming `rhs`.
@@ -371,15 +334,7 @@ impl Unit {
     /// # }
     /// ```
     pub fn add(&mut self, mut rhs: Unit) -> Result<()> {
-        // SAFETY: self is a valid initialized unit. rhs is consumed by this
-        // call, addunit frees rhs internals.
-        // rhs is dropped after this call; freeunit on the now-emptied rhs is safe.
-        // FFI_LOCK is held for the duration.
-        let code = {
-            let _guard = FFI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            unsafe { gnu_units_sys::addunit(self.as_mut_ptr(), rhs.as_mut_ptr()) }
-        };
-        UnitsError::from_code(code).map_or(Ok(()), Err)
+        ffi::addunit(self, &mut rhs)
     }
 
     /// Swaps the numerator and denominator of `self` in place.
@@ -441,12 +396,7 @@ impl Unit {
                 code: gnu_units_sys::E_BADNUM as c_int,
             });
         }
-        let _guard = FFI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: self is a valid initialized unit. expunit modifies the
-        // unit in place, adjusting factor and dimension arrays.
-        // FFI_LOCK is held for the duration.
-        let code = unsafe { gnu_units_sys::expunit(self.as_mut_ptr(), power) };
-        UnitsError::from_code(code).map_or(Ok(()), Err)
+        ffi::expunit(self, power)
     }
 
     /// Takes the `n`th root of `self` in place.
@@ -480,12 +430,7 @@ impl Unit {
                 code: gnu_units_sys::E_NOTROOT as c_int,
             });
         }
-        let _guard = FFI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: self is a valid initialized unit. rootunit modifies the
-        // unit in place. Returns an error code if the root is not exact.
-        // FFI_LOCK is held for the duration.
-        let code = unsafe { gnu_units_sys::rootunit(self.as_mut_ptr(), n) };
-        UnitsError::from_code(code).map_or(Ok(()), Err)
+        ffi::rootunit(self, n)
     }
 
     /// Converts a dimensionless unit to its numeric value.
@@ -513,14 +458,7 @@ impl Unit {
     /// ```
     pub fn to_number(&self) -> Result<f64> {
         let mut tmp = self.clone();
-        let _guard = FFI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: tmp is a deep copy via clone(). unit2num converts the
-        // unit to a dimensionless number, modifying tmp in place. The
-        // original self is not touched. FFI_LOCK is held for the duration.
-        let code = unsafe { gnu_units_sys::unit2num(tmp.as_mut_ptr()) };
-        if let Some(err) = UnitsError::from_code(code) {
-            return Err(err);
-        }
+        ffi::unit2num(&mut tmp)?;
         Ok(tmp.raw.factor)
     }
 
@@ -663,27 +601,15 @@ impl Unit {
     pub fn is_conformable(&self, other: &Unit) -> bool {
         let mut ratio = self.clone();
         let mut other_clone = other.clone();
-        // SAFETY: divunit only moves pointers between the two structs via
-        // moveproduct, no global state is accessed.
-        let div_code =
-            unsafe { gnu_units_sys::divunit(ratio.as_mut_ptr(), other_clone.as_mut_ptr()) };
-        if UnitsError::from_code(div_code).is_some() {
+        if ffi::divunit(&mut ratio, &mut other_clone).is_err() {
             return false;
         }
-        let num_code = {
-            let _guard = FFI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            // SAFETY: ratio is a valid unit after divunit. unit2num checks
-            // whether the ratio is dimensionless, modifying ratio in place.
-            // FFI_LOCK is held for the duration.
-            unsafe { gnu_units_sys::unit2num(ratio.as_mut_ptr()) }
-        };
-        UnitsError::from_code(num_code).is_none()
+        ffi::unit2num(&mut ratio).is_ok()
     }
 
     // SAFETY: Caller must ensure no aliasing pointers to self.raw exist
-    // for the duration of the FFI call. For C functions that access global
-    // state, the caller must also hold FFI_LOCK.
-    unsafe fn as_mut_ptr(&mut self) -> *mut gnu_units_sys::unittype {
+    // for the duration of the FFI call.
+    pub(crate) unsafe fn as_mut_ptr(&mut self) -> *mut gnu_units_sys::unittype {
         &mut self.raw
     }
 }
@@ -704,17 +630,7 @@ impl Clone for Unit {
     /// allocations owned by the `unittype` struct. The cloned `Unit` is
     /// fully independent: dropping either value does not affect the other.
     fn clone(&self) -> Self {
-        let mut dest = Self::new();
-        let mut src = self.raw;
-        let _guard = FFI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: dest is freshly initialized. src is a copy of self.raw
-        // whose pointer fields still point to valid C strings owned by self.
-        // unitcopy deep-copies all strings, so dest gets independent allocations.
-        // FFI_LOCK is held for the duration.
-        unsafe {
-            gnu_units_sys::unitcopy(dest.as_mut_ptr(), &mut src as *mut _);
-        }
-        dest
+        ffi::unitcopy(self)
     }
 }
 
@@ -727,14 +643,7 @@ impl Drop for Unit {
     /// itself is on the Rust stack and is reclaimed by Rust after this
     /// function returns.
     fn drop(&mut self) {
-        // SAFETY: self.raw was initialised by initializeunit and all pointer
-        // fields are either NULL (from zeroed/init) or valid C allocations
-        // (from parseunit/unitcopy). freeunit calls free() on those
-        // allocations, it only reads NULLUNIT (a constant) and does not
-        // access any mutable global state.
-        unsafe {
-            gnu_units_sys::freeunit(self.as_mut_ptr());
-        }
+        ffi::freeunit(self)
     }
 }
 
@@ -772,7 +681,7 @@ pub fn parse(input: &str) -> Result<Unit> {
 #[cfg(feature = "currency-update")]
 pub fn reload_currency(content: &str) {
     ensure_db();
-    let _guard = FFI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = ffi::lock();
     load_definitions(content, c"currency.units");
 }
 
@@ -802,83 +711,11 @@ pub fn reload_currency(content: &str) {
 /// # }
 /// ```
 pub fn convert(from: &str, to: &str) -> Result<f64> {
-    Unit::parse(from)?.convert_to(Unit::parse(to)?)
-}
-
-/// Converts `from` to `to`, supporting function-based targets (e.g. `tempF`).
-///
-/// This mirrors the GNU units CLI behavior: if `to` names a registered
-/// function (like a temperature scale), the function's inverse is applied
-/// to the parsed `from` value. Otherwise, a normal dimensional conversion
-/// is performed.
-///
-/// # Errors
-///
-/// Returns `Err(UnitsError)` when parsing fails, dimensions are incompatible,
-/// or the function inverse cannot be evaluated.
-pub fn convert_with_functions(from: &str, to: &str) -> Result<f64> {
     ensure_db();
-    let _guard = FFI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-    let c_to = CString::new(to).map_err(|_| UnitsError {
-        code: gnu_units_sys::E_PARSE as c_int,
-    })?;
-
-    // Check if `to` is a function name.
-    // SAFETY: c_to is a valid NUL-terminated C string. fnlookup only reads
-    // the string and looks up the function hash table. FFI_LOCK is held.
-    let func_ptr = unsafe { gnu_units_sys::fnlookup(c_to.as_ptr()) };
-    if func_ptr.is_null() {
-        return Unit::parse(from)?.convert_to(Unit::parse(to)?);
+    match ffi::convert_func(from, to) {
+        Some(unit) => Ok(unit.factor()),
+        _ => Unit::parse(from)?.convert_to(Unit::parse(to)?),
     }
-
-    // Function target: parse `from`, then apply the inverse function.
-    let c_from = CString::new(from).map_err(|_| UnitsError {
-        code: gnu_units_sys::E_PARSE as c_int,
-    })?;
-
-    let mut unit = Unit::new();
-    // SAFETY: unit is freshly initialized via new(). c_from is a valid
-    // NUL-terminated C string. parseunit writes into unit without reading
-    // uninitialized data. FFI_LOCK is held.
-    let code = unsafe {
-        gnu_units_sys::parseunit(
-            unit.as_mut_ptr(),
-            c_from.as_ptr(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-        )
-    };
-    if let Some(err) = UnitsError::from_code(code) {
-        return Err(err);
-    }
-
-    // SAFETY: unit_ptr points to unit.raw. evalfunc accesses the unit
-    // through theunitlist[0], may call freeunit+initializeunit+multunit
-    // on it. freeunit nulls the array terminators, so Rust's Drop is
-    // safe (idempotent). FFI_LOCK is held for the entire duration.
-    let mut unit_ptr = unsafe { unit.as_mut_ptr() };
-    let code = unsafe {
-        gnu_units_sys::evalfunc(
-            1,             // param_count
-            &mut unit_ptr, // theunitlist
-            func_ptr,      // infunc
-            1,             // inverse = true
-            0,             // allerror = normal
-        )
-    };
-    if let Some(err) = UnitsError::from_code(code) {
-        return Err(err);
-    }
-
-    // SAFETY: unit.raw is in a valid state after evalfunc. completereduce
-    // gracefully handles empty dimension arrays. FFI_LOCK is held.
-    let code = unsafe { gnu_units_sys::completereduce(unit.as_mut_ptr()) };
-    if let Some(err) = UnitsError::from_code(code) {
-        return Err(err);
-    }
-
-    Ok(unit.factor())
 }
 
 /// Finds all unit definitions that are conformable with `expr`.
