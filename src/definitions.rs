@@ -1,20 +1,59 @@
+//! Parses the embedded `definitions.units` file and registers entries via FFI.
+//!
+//! Handles prefixes, tables, functions, units, and aliases, producing a sorted
+//! [`Vec<Definition>`] used by the public API.
+
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_int;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, RwLock};
 
-static ELEMENTS_UNITS: &str = include_str!("../gnu-units-sys/vendor/units/elements.units");
+use crate::ffi;
+use crate::units;
 
-#[cfg(feature = "currency-update")]
-pub(crate) static CURRENCY_UNITS: &str =
-    include_str!("../gnu-units-sys/vendor/units/currency.units");
-#[cfg(feature = "currency-update")]
-static CRYPTO_UNITS: &str = include_str!("../gnu-units-sys/vendor/units/crypto.units");
-#[cfg(feature = "currency-update")]
-static METAL_PRICES_UNITS: &str = include_str!("../gnu-units-sys/vendor/units/metal_prices.units");
-#[cfg(feature = "currency-update")]
-static CPI_UNITS: &str = include_str!("../gnu-units-sys/vendor/units/cpi.units");
+/// Loads the embedded GNU units definitions exactly once into the C library's
+/// global database.
+///
+/// `DEFINITIONS` is a [`LazyLock`] whose initialiser parses the compile-time embedded
+/// `definitions.units` content and registers each unit, prefix, table, and
+/// function directly with the C library's global hash tables. The `RwLock`
+/// allows [`reload_currency`] to update the list at runtime.
+pub(crate) static DEFINITIONS: LazyLock<RwLock<Vec<Definition>>> = LazyLock::new(|| {
+    {
+        let _guard = ffi::lock();
+        // SAFETY: mylocale/progname point to static C strings that live for the
+        // duration of the process. utf8mode is a plain C int. LazyLock guarantees
+        // this closure runs at most once, so no other FFI call can observe the
+        // globals mid-write.
+        unsafe {
+            gnu_units_sys::mylocale = c"en_US".as_ptr() as *mut std::os::raw::c_char;
+            gnu_units_sys::progname = c"gnu-units".as_ptr() as *mut std::os::raw::c_char;
+            gnu_units_sys::utf8mode = 1;
+        }
+    }
+
+    let definitions = include_str!("../gnu-units-sys/vendor/units/definitions.units");
+    let mut defs = load_definitions(definitions, c"definitions.units");
+    // Emulate C last-write-wins: reverse so last-in-file entries come first
+    defs.reverse();
+    // Stable sort by canonical_name + kind; preserves reverse order within each group
+    defs.sort();
+    // Remove duplicates; keeps first of each group = last-in-file entry
+    defs.dedup();
+    // Final alphabetical ordering for the public API
+    defs.sort_by(|a, b| a.name.cmp(&b.name));
+    RwLock::new(defs)
+});
+
+/// Ensures the GNU units definitions are loaded exactly once.
+///
+/// Forces the [`DEFINITIONS`] lazy initialiser, which embeds `definitions.units` at
+/// compile time and loads it into the C library's global definitions on first
+/// call. All subsequent calls are instant no-ops.
+pub(crate) fn ensure_definitions() {
+    LazyLock::force(&DEFINITIONS);
+}
 
 /// The kind of a definition entry in the GNU units database.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -120,7 +159,7 @@ static FILE_PTRS: LazyLock<Mutex<HashMap<Vec<u8>, usize>>> =
 
 fn intern_filename(filename: &CStr) -> *mut std::os::raw::c_char {
     let key = filename.to_bytes().to_vec();
-    let mut map = FILE_PTRS.lock().unwrap();
+    let mut map = FILE_PTRS.lock().unwrap_or_else(|e| e.into_inner());
     let addr = *map
         .entry(key)
         .or_insert_with(|| CString::new(filename.to_bytes()).unwrap().into_raw() as usize);
@@ -251,22 +290,22 @@ fn load_definitions_inner(
                     }
                     let def = match arg {
                         "elements.units" => {
-                            load_definitions_inner(ELEMENTS_UNITS, c"elements.units", env)
+                            load_definitions_inner(units::ELEMENTS, c"elements.units", env)
                         }
                         #[cfg(feature = "currency-update")]
                         "currency.units" => {
-                            load_definitions_inner(CURRENCY_UNITS, c"currency.units", env)
+                            load_definitions_inner(units::CURRENCY, c"currency.units", env)
                         }
                         #[cfg(feature = "currency-update")]
                         "crypto.units" => {
-                            load_definitions_inner(CRYPTO_UNITS, c"crypto.units", env)
+                            load_definitions_inner(units::CRYPTO, c"crypto.units", env)
                         }
                         #[cfg(feature = "currency-update")]
                         "metal_prices.units" => {
-                            load_definitions_inner(METAL_PRICES_UNITS, c"metal_prices.units", env)
+                            load_definitions_inner(units::METAL_PRICES, c"metal_prices.units", env)
                         }
                         #[cfg(feature = "currency-update")]
-                        "cpi.units" => load_definitions_inner(CPI_UNITS, c"cpi.units", env),
+                        "cpi.units" => load_definitions_inner(units::CPI, c"cpi.units", env),
                         _ => vec![],
                     };
                     results.extend(def);

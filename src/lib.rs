@@ -2,7 +2,6 @@ use std::ffi::CStr;
 use std::fmt;
 use std::mem::MaybeUninit;
 use std::os::raw::c_int;
-use std::sync::LazyLock;
 
 pub use gnu_units_sys;
 
@@ -11,8 +10,13 @@ pub mod currency_update;
 
 mod definitions;
 mod ffi;
+mod units;
 
+#[cfg(feature = "currency-update")]
 use definitions::load_definitions;
+
+use definitions::{DEFINITIONS, ensure_definitions};
+
 pub use definitions::{Definition, DefinitionKind};
 
 #[cfg(feature = "currency-update")]
@@ -145,48 +149,6 @@ pub struct Unit {
 // C heap allocations that are only accessed under the same lock.
 unsafe impl Send for Unit {}
 unsafe impl Sync for Unit {}
-
-/// Loads the embedded GNU units definitions exactly once into the C library's
-/// global database.
-///
-/// `DEFINITIONS` is a [`LazyLock`] whose initialiser parses the compile-time embedded
-/// `definitions.units` content and registers each unit, prefix, table, and
-/// function directly with the C library's global hash tables. All subsequent
-/// accesses are no-ops, the `LazyLock` guarantees the closure runs at most
-/// once, even under concurrent access.
-static DEFINITIONS: LazyLock<Vec<Definition>> = LazyLock::new(|| {
-    // SAFETY: mylocale/progname point to static C strings that live for the
-    // duration of the process. utf8mode is a plain C int. LazyLock guarantees
-    // this closure runs at most once, so no other FFI call can observe the
-    // globals mid-write.
-    let _guard = ffi::lock();
-    unsafe {
-        gnu_units_sys::mylocale = c"en_US".as_ptr() as *mut std::os::raw::c_char;
-        gnu_units_sys::progname = c"gnu-units".as_ptr() as *mut std::os::raw::c_char;
-        gnu_units_sys::utf8mode = 1;
-    }
-
-    let definitions = include_str!("../gnu-units-sys/vendor/units/definitions.units");
-    let mut defs = load_definitions(definitions, c"definitions.units");
-    // Emulate C last-write-wins: reverse so last-in-file entries come first
-    defs.reverse();
-    // Stable sort by canonical_name + kind; preserves reverse order within each group
-    defs.sort();
-    // Remove duplicates; keeps first of each group = last-in-file entry
-    defs.dedup();
-    // Final alphabetical ordering for the public API
-    defs.sort_by(|a, b| a.name.cmp(&b.name));
-    defs
-});
-
-/// Ensures the GNU units definitions are loaded exactly once.
-///
-/// Forces the [`DEFINITIONS`] lazy initialiser, which embeds `definitions.units` at
-/// compile time and loads it into the C library's global definitions on first
-/// call. All subsequent calls are instant no-ops.
-fn ensure_definitions() {
-    LazyLock::force(&DEFINITIONS);
-}
 
 impl Unit {
     /// Creates a freshly initialized unit with factor `1.0` and no dimensions.
@@ -676,14 +638,21 @@ pub fn parse(input: &str) -> Result<Unit> {
 ///
 /// Parses `content` as a GNU units definitions file and registers every
 /// definition found into the C library's global hash tables, overwriting any
-/// existing entry with the same name. Call this after writing an updated
-/// currency file via [`update_currency_file`] to make the new rates effective
-/// for all subsequent [`parse`] and [`convert`] calls.
+/// existing entry with the same name. Also updates the in-memory definitions
+/// list returned by [`list_definitions`].
+///
+/// Call this after writing an updated currency file via
+/// [`update_currency_file`] to make the new rates effective for all subsequent
+/// [`parse`], [`convert`], and [`list_definitions`] calls.
 #[cfg(feature = "currency-update")]
 pub fn reload_currency(content: &str) {
     ensure_definitions();
-    let _guard = ffi::lock();
-    load_definitions(content, c"currency.units");
+    let new_defs = load_definitions(content, c"currency.units");
+    let mut defs = DEFINITIONS.write().unwrap_or_else(|e| e.into_inner());
+    // Remove old entries from the same file, then merge new ones
+    defs.retain(|d| d.kind != DefinitionKind::Unit || !new_defs.iter().any(|n| n.name == d.name));
+    defs.extend(new_defs);
+    defs.sort_by(|a, b| a.name.cmp(&b.name));
 }
 
 /// Parses `from` and `to` as GNU units expressions and returns the numeric
@@ -742,12 +711,12 @@ pub fn convert(from: &str, to: &str) -> Result<f64> {
 pub fn conformable(expr: &str) -> Result<Vec<String>> {
     let target = Unit::parse(expr)?;
     let names = list_definitions()
-        .into_iter()
+        .iter()
         .filter(|d| d.kind == DefinitionKind::Unit)
         .filter_map(|d| {
             let parsed = Unit::parse(&d.name).ok()?;
             if parsed.is_conformable(&target) {
-                Some(d.name)
+                Some(d.name.clone())
             } else {
                 None
             }
@@ -761,9 +730,9 @@ pub fn conformable(expr: &str) -> Result<Vec<String>> {
 /// Each entry contains the unit name, its definition string, and what
 /// kind of definition it is (unit, prefix, function, table, or alias).
 /// The list is sorted alphabetically by name.
-pub fn list_definitions() -> Vec<Definition> {
+pub fn list_definitions() -> std::sync::RwLockReadGuard<'static, Vec<Definition>> {
     ensure_definitions();
-    DEFINITIONS.clone()
+    DEFINITIONS.read().unwrap_or_else(|e| e.into_inner())
 }
 
 #[cfg(test)]

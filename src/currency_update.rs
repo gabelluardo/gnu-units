@@ -222,7 +222,7 @@ struct TemplateData {
 /// * [`UpdateError::Provider`] — the provider returned a logical error (e.g. invalid API
 ///   key, unsupported base currency).
 pub fn fetch_currency_updates(opts: &CurrencyUpdateOptions<'_>) -> Result<String> {
-    use crate::definitions::CURRENCY_UNITS;
+    use crate::units::CURRENCY;
 
     let base = opts.base.to_ascii_uppercase();
     if matches!(opts.source, CurrencySource::Ecb) && base != "EUR" {
@@ -231,7 +231,7 @@ pub fn fetch_currency_updates(opts: &CurrencyUpdateOptions<'_>) -> Result<String
         ));
     }
 
-    let template = parse_template(CURRENCY_UNITS)?;
+    let template = parse_template(CURRENCY)?;
     let rates = fetch_rates(opts.source, &base, opts.api_key)?;
     let today = Utc::now().date_naive().format("%Y-%m-%d").to_string();
     build_currency_template(&template, &rates, &base, opts.source.label(), &today)
