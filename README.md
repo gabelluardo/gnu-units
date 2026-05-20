@@ -11,7 +11,7 @@ This crate provides a high-level Rust API over the vendored GNU units C library,
 - Conformability checking between units
 - List all known unit definitions
 - Optional Rust-native currency rate updates (`currency-update` feature)
-- Statically links vendored GNU units — no system dependencies
+- Statically links vendored GNU units with no system dependencies
 
 ## Usage
 
@@ -47,11 +47,11 @@ assert!(lengths.contains(&"mile".to_string()));
 
 ## Optional features
 
-| Feature | Description |
-|---------|-------------|
+| Feature              | Description                                                |
+| -------------------- | ---------------------------------------------------------- |
 | `vendored` (default) | Build and statically link the vendored GNU units C sources |
-| `bindgen` | Regenerate FFI bindings from the C headers |
-| `currency-update` | Enable Rust-native currency exchange rate updates |
+| `bindgen`            | Regenerate FFI bindings from the C headers                 |
+| `currency-update`    | Enable Rust-native currency exchange rate updates          |
 
 ## License
 

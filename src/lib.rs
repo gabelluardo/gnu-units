@@ -1,3 +1,8 @@
+//! Safe, high-level Rust interface to GNU Units.
+//!
+//! Provides unit parsing, conversion, and definition listing backed by the
+//! vendored C library exposed through [`gnu_units_sys`].
+
 use std::ffi::CStr;
 use std::fmt;
 use std::mem::MaybeUninit;

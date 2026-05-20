@@ -1,3 +1,8 @@
+//! Fetches and parses daily currency exchange rates from the different providers.
+//!
+//! Produces unit definitions that can be registered with the GNU Units engine
+//! to enable currency conversions.
+
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
