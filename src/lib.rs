@@ -12,7 +12,7 @@ pub mod currency_update;
 mod definitions;
 mod ffi;
 
-use definitions::{DEFINITIONS, load_definitions};
+use definitions::load_definitions;
 pub use definitions::{Definition, DefinitionKind};
 
 #[cfg(feature = "currency-update")]
@@ -149,12 +149,12 @@ unsafe impl Sync for Unit {}
 /// Loads the embedded GNU units definitions exactly once into the C library's
 /// global database.
 ///
-/// `DB` is a [`LazyLock`] whose initialiser parses the compile-time embedded
+/// `DEFINITIONS` is a [`LazyLock`] whose initialiser parses the compile-time embedded
 /// `definitions.units` content and registers each unit, prefix, table, and
 /// function directly with the C library's global hash tables. All subsequent
 /// accesses are no-ops, the `LazyLock` guarantees the closure runs at most
 /// once, even under concurrent access.
-static DB: LazyLock<Vec<Definition>> = LazyLock::new(|| {
+static DEFINITIONS: LazyLock<Vec<Definition>> = LazyLock::new(|| {
     // SAFETY: mylocale/progname point to static C strings that live for the
     // duration of the process. utf8mode is a plain C int. LazyLock guarantees
     // this closure runs at most once, so no other FFI call can observe the
@@ -166,7 +166,8 @@ static DB: LazyLock<Vec<Definition>> = LazyLock::new(|| {
         gnu_units_sys::utf8mode = 1;
     }
 
-    let mut defs = load_definitions(DEFINITIONS, c"definitions.units");
+    let definitions = include_str!("../gnu-units-sys/vendor/units/definitions.units");
+    let mut defs = load_definitions(definitions, c"definitions.units");
     // Emulate C last-write-wins: reverse so last-in-file entries come first
     defs.reverse();
     // Stable sort by canonical_name + kind; preserves reverse order within each group
@@ -178,13 +179,13 @@ static DB: LazyLock<Vec<Definition>> = LazyLock::new(|| {
     defs
 });
 
-/// Ensures the GNU units database is loaded exactly once.
+/// Ensures the GNU units definitions are loaded exactly once.
 ///
-/// Forces the [`DB`] lazy initialiser, which embeds `definitions.units` at
-/// compile time and loads it into the C library's global database on first
+/// Forces the [`DEFINITIONS`] lazy initialiser, which embeds `definitions.units` at
+/// compile time and loads it into the C library's global definitions on first
 /// call. All subsequent calls are instant no-ops.
-fn ensure_db() {
-    LazyLock::force(&DB);
+fn ensure_definitions() {
+    LazyLock::force(&DEFINITIONS);
 }
 
 impl Unit {
@@ -248,7 +249,7 @@ impl Unit {
     /// # }
     /// ```
     pub fn parse(input: &str) -> Result<Self> {
-        ensure_db();
+        ensure_definitions();
         ffi::parseunit(input)
     }
 
@@ -680,7 +681,7 @@ pub fn parse(input: &str) -> Result<Unit> {
 /// for all subsequent [`parse`] and [`convert`] calls.
 #[cfg(feature = "currency-update")]
 pub fn reload_currency(content: &str) {
-    ensure_db();
+    ensure_definitions();
     let _guard = ffi::lock();
     load_definitions(content, c"currency.units");
 }
@@ -711,7 +712,7 @@ pub fn reload_currency(content: &str) {
 /// # }
 /// ```
 pub fn convert(from: &str, to: &str) -> Result<f64> {
-    ensure_db();
+    ensure_definitions();
     if let Some(unit) = ffi::convert_func(from, to) {
         return Ok(unit.factor());
     }
@@ -761,8 +762,8 @@ pub fn conformable(expr: &str) -> Result<Vec<String>> {
 /// kind of definition it is (unit, prefix, function, table, or alias).
 /// The list is sorted alphabetically by name.
 pub fn list_definitions() -> Vec<Definition> {
-    ensure_db();
-    DB.clone()
+    ensure_definitions();
+    DEFINITIONS.clone()
 }
 
 #[cfg(test)]

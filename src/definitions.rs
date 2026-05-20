@@ -4,8 +4,6 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_int;
 use std::sync::{LazyLock, Mutex};
 
-pub(crate) static DEFINITIONS: &str =
-    include_str!("../gnu-units-sys/vendor/units/definitions.units");
 static ELEMENTS_UNITS: &str = include_str!("../gnu-units-sys/vendor/units/elements.units");
 
 #[cfg(feature = "currency-update")]
