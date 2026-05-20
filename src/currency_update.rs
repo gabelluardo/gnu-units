@@ -532,28 +532,43 @@ mod tests {
         assert_eq!(result, expected);
     }
 
-    #[test]
-    fn parse_template_extracts_prelude() {
-        let input = "some preamble text\n# Currency exchange rates\nrate_line\n";
-
+    #[rstest]
+    #[case::extracts_pairs(
+        "USD dollar\nEUR euro\n# Currency exchange rates\n",
+        vec![("USD", "dollar"), ("EUR", "euro")]
+    )]
+    #[case::skips_comment_lines(
+        "# this is a comment\nUSD dollar\n# Currency exchange rates\n",
+        vec![("USD", "dollar")]
+    )]
+    #[case::skips_non_three_letter_codes(
+        "US dollar\nEURO euro\nUSD usdollar\n# Currency exchange rates\n",
+        vec![("USD", "usdollar")]
+    )]
+    #[case::skips_lines_without_unit_name(
+        "USD\nEUR euro\n# Currency exchange rates\n",
+        vec![("EUR", "euro")]
+    )]
+    fn parse_template_code_to_unit(#[case] input: &str, #[case] expected: Vec<(&str, &str)>) {
         let result = parse_template(input).unwrap();
 
-        assert_eq!(result.prelude, "some preamble text");
+        let expected: Vec<(String, String)> = expected
+            .into_iter()
+            .map(|(c, u)| (c.to_string(), u.to_string()))
+            .collect();
+        assert_eq!(result.code_to_unit, expected);
     }
 
-    #[test]
-    fn parse_template_extracts_code_to_unit_pairs() {
-        let input = "USD dollar\nEUR euro\n# Currency exchange rates\n";
-
+    #[rstest]
+    #[case::extracts_prelude(
+        "some preamble text\n# Currency exchange rates\nrate_line\n",
+        "some preamble text"
+    )]
+    #[case::empty_when_marker_at_start("# Currency exchange rates\ndollar 1|1.0 USD\n", "")]
+    fn parse_template_prelude(#[case] input: &str, #[case] expected: &str) {
         let result = parse_template(input).unwrap();
 
-        assert_eq!(
-            result.code_to_unit,
-            vec![
-                ("USD".to_string(), "dollar".to_string()),
-                ("EUR".to_string(), "euro".to_string()),
-            ]
-        );
+        assert_eq!(result.prelude, expected);
     }
 
     #[test]
@@ -574,81 +589,32 @@ mod tests {
 
         let result = parse_template(input);
 
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn parse_template_error_on_missing_marker_message() {
-        let input = "no marker here\n";
-
-        let result = parse_template(input);
-
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("missing rates section marker"));
     }
 
     #[test]
-    fn parse_template_skips_comment_lines_in_prelude() {
-        let input = "# this is a comment\nUSD dollar\n# Currency exchange rates\n";
-
-        let result = parse_template(input).unwrap();
-
-        assert_eq!(
-            result.code_to_unit,
-            vec![("USD".to_string(), "dollar".to_string())]
-        );
-    }
-
-    #[test]
-    fn parse_template_skips_non_three_letter_codes() {
-        let input = "US dollar\nEURO euro\nUSD usdollar\n# Currency exchange rates\n";
-
-        let result = parse_template(input).unwrap();
-
-        assert_eq!(
-            result.code_to_unit,
-            vec![("USD".to_string(), "usdollar".to_string())]
-        );
-    }
-
-    #[test]
-    fn parse_template_skips_code_lines_without_unit_name() {
-        let input = "USD\nEUR euro\n# Currency exchange rates\n";
-
-        let result = parse_template(input).unwrap();
-
-        assert_eq!(
-            result.code_to_unit,
-            vec![("EUR".to_string(), "euro".to_string())]
-        );
-    }
-
-    #[test]
-    fn parse_template_empty_prelude_when_marker_at_start() {
+    fn parse_template_empty_code_to_unit_when_marker_at_start() {
         let input = "# Currency exchange rates\ndollar 1|1.0 USD\n";
 
         let result = parse_template(input).unwrap();
 
-        assert_eq!(result.prelude, "");
         assert!(result.code_to_unit.is_empty());
     }
 
-    #[test]
-    fn parse_template_skips_message_directives_in_rates_section() {
-        let input = "# Currency exchange rates\n!message some message\ndollar 1|1.0 USD\n";
-
+    #[rstest]
+    #[case::skips_message_directives(
+        "# Currency exchange rates\n!message some message\ndollar 1|1.0 USD\n",
+        "!message"
+    )]
+    #[case::skips_empty_definition("# Currency exchange rates\ndollar\n", "dollar")]
+    fn parse_template_excludes_from_existing_definitions(
+        #[case] input: &str,
+        #[case] absent_key: &str,
+    ) {
         let result = parse_template(input).unwrap();
 
-        assert!(!result.existing_definitions.contains_key("!message"));
-    }
-
-    #[test]
-    fn parse_template_skips_rate_lines_with_empty_definition() {
-        let input = "# Currency exchange rates\ndollar\n";
-
-        let result = parse_template(input).unwrap();
-
-        assert!(!result.existing_definitions.contains_key("dollar"));
+        assert!(!result.existing_definitions.contains_key(absent_key));
     }
 
     #[test]
@@ -910,32 +876,25 @@ mod tests {
         assert_eq!(map.get("GBP"), Some(&0.79_f64));
     }
 
-    #[test]
-    fn parse_open_er_response_error_on_failure_result() {
-        let body = OpenErApiResponse {
-            result: Some("error".to_string()),
-            error_type: Some("invalid-key".to_string()),
-            rates: None,
-        };
+    #[rstest]
+    #[case::failure_result(
+        OpenErApiResponse { result: Some("error".to_string()), error_type: Some("invalid-key".to_string()), rates: None },
+        "invalid-key"
+    )]
+    #[case::missing_rates(
+        OpenErApiResponse { result: Some("success".to_string()), error_type: None, rates: None },
+        "missing rates"
+    )]
+    fn parse_open_er_response_error(
+        #[case] body: OpenErApiResponse,
+        #[case] expected_substr: &str,
+    ) {
+        let msg = parse_open_er_response(body).unwrap_err().to_string();
 
-        let result = parse_open_er_response(body);
-
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("invalid-key"));
-    }
-
-    #[test]
-    fn parse_open_er_response_error_on_missing_rates() {
-        let body = OpenErApiResponse {
-            result: Some("success".to_string()),
-            error_type: None,
-            rates: None,
-        };
-
-        let result = parse_open_er_response(body);
-
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("missing rates"));
+        assert!(
+            msg.contains(expected_substr),
+            "expected '{expected_substr}' in: {msg}"
+        );
     }
 
     #[test]
@@ -967,32 +926,25 @@ mod tests {
         assert_eq!(map.get("EUR"), Some(&0.92_f64));
     }
 
-    #[test]
-    fn parse_keyed_er_response_error_on_failure_result() {
-        let body = KeyedErApiResponse {
-            result: Some("error".to_string()),
-            error_type: Some("quota-reached".to_string()),
-            conversion_rates: None,
-        };
+    #[rstest]
+    #[case::failure_result(
+        KeyedErApiResponse { result: Some("error".to_string()), error_type: Some("quota-reached".to_string()), conversion_rates: None },
+        "quota-reached"
+    )]
+    #[case::missing_conversion_rates(
+        KeyedErApiResponse { result: Some("success".to_string()), error_type: None, conversion_rates: None },
+        "missing conversion_rates"
+    )]
+    fn parse_keyed_er_response_error(
+        #[case] body: KeyedErApiResponse,
+        #[case] expected_substr: &str,
+    ) {
+        let msg = parse_keyed_er_response(body).unwrap_err().to_string();
 
-        let result = parse_keyed_er_response(body);
-
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("quota-reached"));
-    }
-
-    #[test]
-    fn parse_keyed_er_response_error_on_missing_conversion_rates() {
-        let body = KeyedErApiResponse {
-            result: Some("success".to_string()),
-            error_type: None,
-            conversion_rates: None,
-        };
-
-        let result = parse_keyed_er_response(body);
-
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("missing conversion_rates"));
+        assert!(
+            msg.contains(expected_substr),
+            "expected '{expected_substr}' in: {msg}"
+        );
     }
 
     #[test]

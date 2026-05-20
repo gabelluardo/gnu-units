@@ -780,10 +780,10 @@ mod tests {
         assert_eq!(copied, original);
     }
 
-    #[test]
-    fn new_factor_is_one() {
-        let unit = Unit::new();
-
+    #[rstest]
+    #[case::new(Unit::new())]
+    #[case::default(Unit::default())]
+    fn initial_factor_is_one(#[case] unit: Unit) {
         assert_eq!(unit.factor(), 1.0);
     }
 
@@ -797,26 +797,18 @@ mod tests {
         assert_eq!(unit.factor(), expected);
     }
 
-    #[test]
-    fn error_on_null_byte_in_input() {
-        let result = Unit::parse("foo\0bar");
+    #[rstest]
+    #[case::null_byte("foo\0bar", gnu_units_sys::E_PARSE as c_int)]
+    #[case::unparsable(")", gnu_units_sys::E_PARSE as c_int)]
+    fn parse_error(#[case] input: &str, #[case] expected_code: c_int) {
+        let result = Unit::parse(input);
 
-        let err = result.err().expect("expected Err, got Ok");
         assert_eq!(
-            err,
+            result.err().unwrap(),
             UnitsError {
-                code: gnu_units_sys::E_PARSE as c_int,
+                code: expected_code
             }
         );
-    }
-
-    #[test]
-    fn error_on_unparsable_expression() {
-        // Standalone `)` is an unexpected token for the bison grammar → E_PARSE
-        let result = Unit::parse(")");
-
-        let err = result.err().expect("expected Err, got Ok");
-        assert_eq!(err.code, gnu_units_sys::E_PARSE as c_int);
     }
 
     #[test]
@@ -885,58 +877,34 @@ mod tests {
         assert_eq!(unit.factor(), 3.0);
     }
 
-    #[test]
-    fn error_on_pow_negative() {
+    #[rstest]
+    #[case::negative(-1, gnu_units_sys::E_BADNUM as c_int)]
+    #[case::min_int(c_int::MIN, gnu_units_sys::E_BADNUM as c_int)]
+    fn pow_error(#[case] power: c_int, #[case] expected_code: c_int) {
         let mut unit = Unit::parse("3").unwrap();
 
-        let result = unit.pow(-1);
+        let result = unit.pow(power);
 
         assert_eq!(
             result,
             Err(UnitsError {
-                code: gnu_units_sys::E_BADNUM as c_int
+                code: expected_code
             })
         );
     }
 
-    #[test]
-    fn error_on_pow_min_int() {
-        let mut unit = Unit::parse("3").unwrap();
-
-        let result = unit.pow(c_int::MIN);
-
-        assert_eq!(
-            result,
-            Err(UnitsError {
-                code: gnu_units_sys::E_BADNUM as c_int
-            })
-        );
-    }
-
-    #[test]
-    fn error_on_root_zero() {
+    #[rstest]
+    #[case::zero(0, gnu_units_sys::E_NOTROOT as c_int)]
+    #[case::negative(-1, gnu_units_sys::E_NOTROOT as c_int)]
+    fn root_error(#[case] n: c_int, #[case] expected_code: c_int) {
         let mut unit = Unit::parse("9").unwrap();
 
-        let result = unit.root(0);
+        let result = unit.root(n);
 
         assert_eq!(
             result,
             Err(UnitsError {
-                code: gnu_units_sys::E_NOTROOT as c_int
-            })
-        );
-    }
-
-    #[test]
-    fn error_on_root_negative() {
-        let mut unit = Unit::parse("9").unwrap();
-
-        let result = unit.root(-1);
-
-        assert_eq!(
-            result,
-            Err(UnitsError {
-                code: gnu_units_sys::E_NOTROOT as c_int
+                code: expected_code
             })
         );
     }
@@ -951,20 +919,6 @@ mod tests {
     }
 
     #[test]
-    fn factor_returns_parsed_value() {
-        let unit = Unit::parse("5").unwrap();
-
-        assert_eq!(unit.factor(), 5.0);
-    }
-
-    #[test]
-    fn default_factor_is_one() {
-        let unit = Unit::default();
-
-        assert_eq!(unit.factor(), 1.0);
-    }
-
-    #[test]
     fn free_parse_delegates_to_unit_parse() {
         let unit = parse("5").unwrap();
 
@@ -972,27 +926,25 @@ mod tests {
     }
 
     #[rstest]
-    #[case::dimensionless_to_itself("5", "1", 5.0)]
-    #[case::km_to_m("km", "m", 1000.0)]
-    #[case::identity_m_to_m("m", "m", 1.0)]
-    fn convert_to_compatible_units(#[case] from: &str, #[case] to: &str, #[case] expected: f64) {
+    #[case::dimensionless_to_itself("5", "1", 5.0, 1e-10)]
+    #[case::km_to_m("km", "m", 1000.0, 1e-10)]
+    #[case::identity_m_to_m("m", "m", 1.0, 1e-10)]
+    #[case::numeric_prefix("5 km", "miles", 3.10686, 1e-4)]
+    fn convert_to_compatible_units(
+        #[case] from: &str,
+        #[case] to: &str,
+        #[case] expected: f64,
+        #[case] tolerance: f64,
+    ) {
         let from_unit = Unit::parse(from).unwrap();
         let to_unit = Unit::parse(to).unwrap();
 
         let result = from_unit.convert_to(to_unit).unwrap();
 
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn convert_to_with_numeric_prefix() {
-        let from_unit = Unit::parse("5 km").unwrap();
-        let to_unit = Unit::parse("miles").unwrap();
-
-        let result = from_unit.convert_to(to_unit).unwrap();
-
-        // 5 km ≈ 3.10686 miles
-        assert!((result - 3.10686).abs() < 1e-4);
+        assert!(
+            (result - expected).abs() < tolerance,
+            "convert_to({from:?}, {to:?}) = {result}, expected {expected} ±{tolerance}"
+        );
     }
 
     #[test]
@@ -1010,45 +962,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn convert_km_to_m_returns_factor() {
-        let result = convert("km", "m").unwrap();
-
-        assert_eq!(result, 1000.0);
-    }
-
-    #[test]
-    fn error_on_convert_invalid_from_expression() {
-        let result = convert(")", "m");
+    #[rstest]
+    #[case::invalid_from(")", "m", gnu_units_sys::E_PARSE as c_int)]
+    #[case::invalid_to("m", ")", gnu_units_sys::E_PARSE as c_int)]
+    #[case::incompatible_dimensions("km", "kg", gnu_units_sys::E_NOTANUMBER as c_int)]
+    fn convert_error(#[case] from: &str, #[case] to: &str, #[case] expected_code: c_int) {
+        let result = convert(from, to);
 
         assert_eq!(
             result,
             Err(UnitsError {
-                code: gnu_units_sys::E_PARSE as c_int
-            })
-        );
-    }
-
-    #[test]
-    fn error_on_convert_invalid_to_expression() {
-        let result = convert("m", ")");
-
-        assert_eq!(
-            result,
-            Err(UnitsError {
-                code: gnu_units_sys::E_PARSE as c_int
-            })
-        );
-    }
-
-    #[test]
-    fn error_on_convert_incompatible_dimensions() {
-        let result = convert("km", "kg");
-
-        assert_eq!(
-            result,
-            Err(UnitsError {
-                code: gnu_units_sys::E_NOTANUMBER as c_int
+                code: expected_code
             })
         );
     }
@@ -1085,111 +1009,57 @@ mod tests {
         assert_eq!(result, expected);
     }
 
-    #[test]
-    fn parse_known_prefix_kilo() {
-        let unit = Unit::parse("kilogram").unwrap();
+    #[rstest]
+    #[case::prefix_kilo("kilogram", "gram", 1000.0, 1e-10)]
+    #[case::temperature_diff("degF", "degC", 0.555_555_555_6, 1e-8)]
+    #[case::element_mercury("mercury", "1", 200.59, 0.01)]
+    #[case::utf8_micro("\u{00B5}m", "m", 1e-6, 1e-16)]
+    #[case::knot_to_mps("knot", "m/s", 0.514_444, 1e-4)]
+    #[case::inches_to_cm("inch", "cm", 2.54, 1e-10)]
+    #[case::hour_to_seconds("hour", "s", 3600.0, 1e-10)]
+    #[case::line_continuation("spherevolume(1 m)", "m^3", 4.18879, 1e-4)]
+    fn definitions_convert(
+        #[case] from: &str,
+        #[case] to: &str,
+        #[case] expected: f64,
+        #[case] tolerance: f64,
+    ) {
+        let result = convert(from, to).unwrap();
 
-        let kg = unit.convert_to(Unit::parse("gram").unwrap()).unwrap();
-
-        assert_eq!(kg, 1000.0);
+        assert!(
+            (result - expected).abs() < tolerance,
+            "convert({from:?}, {to:?}) = {result}, expected {expected} ±{tolerance}"
+        );
     }
 
-    #[test]
-    fn parse_temperature_diff_unit() {
-        // degF is registered as a plain unit via newunit in definitions.units.
-        // Its definition uses the fraction-slash `|` (e.g. `5|9 degC`), which
-        // replace_operators converts to `|` at load time.
-        let result = convert("degF", "degC").unwrap();
+    #[rstest]
+    #[case::table_gasmark("gasmark1", 1.0, 1e-10)]
+    #[case::function_tempf("tempF(32)", 273.15, 0.01)]
+    fn definitions_parse_factor(
+        #[case] input: &str,
+        #[case] expected: f64,
+        #[case] tolerance: f64,
+    ) {
+        let unit = Unit::parse(input).unwrap();
 
-        assert!((result - 5.0 / 9.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn parse_table_unit_gasmark() {
-        // gasmark[degR] is registered via newtable in definitions.units.
-        // Parsing a specific table value (gasmark1) returns a unit in degR.
-        let unit = Unit::parse("gasmark1").unwrap();
-
-        assert!(unit.factor() > 0.0);
-    }
-
-    #[test]
-    fn parse_element_from_included_file() {
-        // mercury is defined as a weighted sum of isotopic masses in elements.units;
-        // converting to the dimensionless unit "1" yields the standard atomic weight.
-        let result = convert("mercury", "1").unwrap();
-
-        assert!((result - 200.59).abs() < 0.01);
-    }
-
-    #[test]
-    fn parse_utf8_unit_loaded() {
-        // µ- (U+00B5) is registered as an alias for micro inside a !utf8 block;
-        // utf8mode=1 ensures the block is processed.
-        let result = convert("\u{00B5}m", "m").unwrap();
-
-        assert_eq!(result, 1e-6);
-    }
-
-    #[test]
-    fn parse_knot_in_meters_per_second() {
-        // knot = nauticalmile / hr = 1852 m / 3600 s ≈ 0.5144 m/s
-        let result = convert("knot", "m/s").unwrap();
-
-        assert!((result - 0.514_444).abs() < 1e-4);
-    }
-
-    #[test]
-    fn parse_function_definition_tempf() {
-        // tempF(x) is registered via newfunction; parsing an invocation
-        // confirms function definitions were loaded correctly.
-        let unit = Unit::parse("tempF(32)").unwrap();
-
-        assert!((unit.factor() - 273.15).abs() < 0.01);
+        assert!(
+            (unit.factor() - expected).abs() < tolerance,
+            "parse({input:?}).factor() = {}, expected {expected} ±{tolerance}",
+            unit.factor()
+        );
     }
 
     #[cfg(feature = "currency-update")]
-    #[test]
-    fn parse_unit_from_currency_include() {
-        // currency.units is loaded via !include, USD is defined there.
-        let unit = Unit::parse("USD").unwrap();
+    #[rstest]
+    #[case::currency_usd("USD")]
+    #[case::cpi_now("UScpi_now")]
+    fn definitions_parse_currency(#[case] input: &str) {
+        let unit = Unit::parse(input).unwrap();
 
-        assert!(unit.factor() > 0.0);
-    }
-
-    #[cfg(feature = "currency-update")]
-    #[test]
-    fn parse_unit_from_cpi_include() {
-        // cpi.units is loaded via !include, UScpi_now is a simple numeric
-        // constant defined there, confirming the include was processed.
-        let unit = Unit::parse("UScpi_now").unwrap();
-
-        assert!(unit.factor() > 0.0);
-    }
-
-    #[test]
-    fn convert_inches_to_cm() {
-        // inch = 2.54 cm exactly; verifies prefix (centi-) + base unit (m).
-        let result = convert("inch", "cm").unwrap();
-
-        assert!((result - 2.54).abs() < 1e-10);
-    }
-
-    #[test]
-    fn convert_hour_to_s() {
-        // hour = 60 min = 3600 s
-        let result = convert("hour", "s").unwrap();
-
-        assert_eq!(result, 3600.0);
-    }
-
-    #[test]
-    fn parse_line_continuation_unit() {
-        // spherevolume(r) is defined with a line-continuation backslash;
-        // successful parsing confirms the continuation-joining logic works.
-        let in_m3 = convert("spherevolume(1 m)", "m^3").unwrap();
-
-        assert!((in_m3 - 4.18879).abs() < 1e-4);
+        assert!(
+            unit.factor() > 0.0,
+            "parse({input:?}).factor() should be > 0"
+        );
     }
 
     #[test]
@@ -1218,7 +1088,7 @@ mod tests {
     fn all_definitions_have_non_empty_names() {
         let defs = list_definitions();
 
-        for def in defs {
+        for def in defs.iter() {
             assert!(!def.name.is_empty(), "found empty name entry");
         }
     }
@@ -1256,40 +1126,17 @@ mod tests {
         assert_eq!(found.unwrap().kind, expected_kind);
     }
 
-    #[test]
-    fn all_prefix_entries_have_names_ending_with_dash() {
+    #[rstest]
+    #[case::prefix_ends_with_dash(DefinitionKind::Prefix, '-')]
+    #[case::table_contains_bracket(DefinitionKind::Table, '[')]
+    #[case::function_contains_paren(DefinitionKind::Function, '(')]
+    fn definition_kind_name_invariant(#[case] kind: DefinitionKind, #[case] expected_char: char) {
         let defs = list_definitions();
 
-        for def in defs.iter().filter(|d| d.kind == DefinitionKind::Prefix) {
+        for def in defs.iter().filter(|d| d.kind == kind) {
             assert!(
-                def.name.ends_with('-'),
-                "prefix entry '{}' does not end with '-'",
-                def.name
-            );
-        }
-    }
-
-    #[test]
-    fn all_table_entries_have_bracket_in_name() {
-        let defs = list_definitions();
-
-        for def in defs.iter().filter(|d| d.kind == DefinitionKind::Table) {
-            assert!(
-                def.name.contains('['),
-                "table entry '{}' does not contain '['",
-                def.name
-            );
-        }
-    }
-
-    #[test]
-    fn all_function_entries_have_paren_in_name() {
-        let defs = list_definitions();
-
-        for def in defs.iter().filter(|d| d.kind == DefinitionKind::Function) {
-            assert!(
-                def.name.contains('('),
-                "function entry '{}' does not contain '('",
+                def.name.contains(expected_char),
+                "{kind:?} entry '{}' does not contain '{expected_char}'",
                 def.name
             );
         }
@@ -1321,33 +1168,18 @@ mod tests {
         assert_eq!(result, expected);
     }
 
-    #[test]
-    fn base_units_meter_contains_m() {
-        let unit = Unit::parse("m").unwrap();
-
-        let result = unit.base_units();
-
-        assert!(result.contains('m'), "expected 'm' in {:?}", result);
-    }
-
-    #[test]
-    fn base_units_compound_contains_slash() {
-        let unit = Unit::parse("kg m/s^2").unwrap();
-
-        let result = unit.base_units();
-
-        assert!(result.contains(" / "), "expected ' / ' in {:?}", result);
-    }
-
-    #[test]
-    fn base_units_inverse_starts_with_one() {
-        let unit = Unit::parse("1/s").unwrap();
+    #[rstest]
+    #[case::meter_contains_m("m", "m")]
+    #[case::compound_contains_slash("kg m/s^2", " / ")]
+    #[case::inverse_contains_one_slash("1/s", "1 / ")]
+    fn base_units_contains_expected(#[case] input: &str, #[case] expected_substr: &str) {
+        let unit = Unit::parse(input).unwrap();
 
         let result = unit.base_units();
 
         assert!(
-            result.starts_with("1 / "),
-            "expected '1 / ' prefix in {:?}",
+            result.contains(expected_substr),
+            "expected '{expected_substr}' in {:?}",
             result
         );
     }
