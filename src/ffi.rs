@@ -18,13 +18,12 @@ pub(crate) fn lock() -> std::sync::MutexGuard<'static, ()> {
 
 /// Parses `input` and returns the resulting [`Unit`]. Acquires `GNU_UNITS_MUTEX` internally.
 pub(crate) fn parseunit(input: &str) -> Result<Unit> {
-    let mut unit = Unit::new();
+    let _guard = lock();
 
+    let mut unit = Unit::new();
     let c_input = CString::new(input).map_err(|_| UnitsError {
         code: gnu_units_sys::E_PARSE as c_int,
     })?;
-
-    let _guard = lock();
     // SAFETY: unit is freshly initialized. c_input is a valid NUL-terminated
     // C string. parseunit writes into unit without reading uninitialized data.
     // GNU_UNITS_MUTEX is held.
@@ -96,11 +95,10 @@ pub(crate) fn unit2num(unit: &mut Unit) -> Result<()> {
 /// function, `from` cannot be parsed, or evaluation/reduction fails.
 /// Acquires `GNU_UNITS_MUTEX` internally.
 pub(crate) fn convert_func(from: &str, to: &str) -> Option<Unit> {
-    let c_name = CString::new(to).ok()?;
-    let c_from = CString::new(from).ok()?;
-
     let _guard = lock();
 
+    let c_name = CString::new(to).ok()?;
+    let c_from = CString::new(from).ok()?;
     // SAFETY: c_name is a valid NUL-terminated CString. GNU_UNITS_MUTEX is held.
     let func_ptr = unsafe { gnu_units_sys::fnlookup(c_name.as_ptr()) };
     if func_ptr.is_null() {
@@ -131,6 +129,9 @@ pub(crate) fn convert_func(from: &str, to: &str) -> Option<Unit> {
     if UnitsError::from_code(code).is_some() {
         return None;
     }
+
+    // Verify evalfunc did not reassign the pointer (would indicate UB).
+    debug_assert!(std::ptr::eq(unit_ptr, unsafe { unit.as_mut_ptr() }));
 
     // SAFETY: unit_ptr still points to unit.raw (evalfunc does not reassign
     // the pointer). completereduce reduces it to base units. GNU_UNITS_MUTEX is held.
@@ -163,5 +164,128 @@ pub(crate) fn freeunit(src: &mut Unit) {
     // access any mutable global state.
     unsafe {
         gnu_units_sys::freeunit(src.as_mut_ptr());
+    }
+}
+
+/// Registers a new unit prefix. Acquires `GNU_UNITS_MUTEX` internally.
+pub(crate) fn newprefix(
+    name: &str,
+    def: &str,
+    linenum: c_int,
+    file_ptr: *mut std::os::raw::c_char,
+) {
+    let _guard = lock();
+    let mut name_buf: Vec<u8> = name.bytes().chain(std::iter::once(0)).collect();
+    let mut def_buf: Vec<u8> = def.bytes().chain(std::iter::once(0)).collect();
+    let mut count: c_int = 0;
+    // SAFETY: name_buf and def_buf are null-terminated mutable buffers.
+    // The C function copies both strings internally (dupstr).
+    // file_ptr is a leaked CString valid for the process lifetime.
+    // GNU_UNITS_MUTEX is held.
+    unsafe {
+        gnu_units_sys::newprefix(
+            name_buf.as_mut_ptr() as *mut std::os::raw::c_char,
+            def_buf.as_mut_ptr() as *mut std::os::raw::c_char,
+            &mut count,
+            linenum,
+            file_ptr,
+            ptr::null_mut(),
+            1,
+        );
+    }
+}
+
+/// Registers a new piecewise table. Acquires `GNU_UNITS_MUTEX` internally.
+pub(crate) fn newtable(name: &str, def: &str, linenum: c_int, file_ptr: *mut std::os::raw::c_char) {
+    let _guard = lock();
+    let mut name_buf: Vec<u8> = name.bytes().chain(std::iter::once(0)).collect();
+    let mut def_buf: Vec<u8> = def.bytes().chain(std::iter::once(0)).collect();
+    let mut count: c_int = 0;
+    // SAFETY: name_buf and def_buf are null-terminated mutable buffers.
+    // The C function copies both strings internally (dupstr).
+    // file_ptr is a leaked CString valid for the process lifetime.
+    // GNU_UNITS_MUTEX is held.
+    unsafe {
+        gnu_units_sys::newtable(
+            name_buf.as_mut_ptr() as *mut std::os::raw::c_char,
+            def_buf.as_mut_ptr() as *mut std::os::raw::c_char,
+            &mut count,
+            linenum,
+            file_ptr,
+            ptr::null_mut(),
+            1,
+        );
+    }
+}
+
+/// Registers a new conversion function. Acquires `GNU_UNITS_MUTEX` internally.
+pub(crate) fn newfunction(
+    name: &str,
+    def: &str,
+    linenum: c_int,
+    file_ptr: *mut std::os::raw::c_char,
+) {
+    let _guard = lock();
+    let mut name_buf: Vec<u8> = name.bytes().chain(std::iter::once(0)).collect();
+    let mut def_buf: Vec<u8> = def.bytes().chain(std::iter::once(0)).collect();
+    let mut count: c_int = 0;
+    // SAFETY: name_buf and def_buf are null-terminated mutable buffers.
+    // The C function copies both strings internally (dupstr).
+    // file_ptr is a leaked CString valid for the process lifetime.
+    // GNU_UNITS_MUTEX is held.
+    unsafe {
+        gnu_units_sys::newfunction(
+            name_buf.as_mut_ptr() as *mut std::os::raw::c_char,
+            def_buf.as_mut_ptr() as *mut std::os::raw::c_char,
+            &mut count,
+            linenum,
+            file_ptr,
+            ptr::null_mut(),
+            1,
+        );
+    }
+}
+
+/// Registers a new unit. Acquires `GNU_UNITS_MUTEX` internally.
+pub(crate) fn newunit(name: &str, def: &str, linenum: c_int, file_ptr: *mut std::os::raw::c_char) {
+    let _guard = lock();
+    let mut name_buf: Vec<u8> = name.bytes().chain(std::iter::once(0)).collect();
+    let mut def_buf: Vec<u8> = def.bytes().chain(std::iter::once(0)).collect();
+    let mut count: c_int = 0;
+    // SAFETY: name_buf and def_buf are null-terminated mutable buffers.
+    // The C function copies both strings internally (dupstr).
+    // file_ptr is a leaked CString valid for the process lifetime.
+    // GNU_UNITS_MUTEX is held.
+    unsafe {
+        gnu_units_sys::newunit(
+            name_buf.as_mut_ptr() as *mut std::os::raw::c_char,
+            def_buf.as_mut_ptr() as *mut std::os::raw::c_char,
+            &mut count,
+            linenum,
+            file_ptr,
+            ptr::null_mut(),
+            1,
+            0,
+        );
+    }
+}
+
+/// Registers a new unit list alias. Acquires `GNU_UNITS_MUTEX` internally.
+pub(crate) fn newalias(name: &str, def: &str, linenum: c_int, file_ptr: *mut std::os::raw::c_char) {
+    let _guard = lock();
+    let mut name_buf: Vec<u8> = name.bytes().chain(std::iter::once(0)).collect();
+    let mut def_buf: Vec<u8> = def.bytes().chain(std::iter::once(0)).collect();
+    // SAFETY: name_buf and def_buf are null-terminated mutable buffers.
+    // The C function copies both strings internally (dupstr).
+    // file_ptr is a leaked CString valid for the process lifetime.
+    // GNU_UNITS_MUTEX is held.
+    unsafe {
+        gnu_units_sys::newalias(
+            name_buf.as_mut_ptr() as *mut std::os::raw::c_char,
+            def_buf.as_mut_ptr() as *mut std::os::raw::c_char,
+            linenum,
+            file_ptr,
+            ptr::null_mut(),
+        );
     }
 }

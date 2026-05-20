@@ -238,21 +238,7 @@ fn load_definitions_inner(
                     if name.is_empty() {
                         continue;
                     }
-                    let mut name_buf: Vec<u8> = name.bytes().chain(std::iter::once(0)).collect();
-                    let mut def_buf: Vec<u8> = def.bytes().chain(std::iter::once(0)).collect();
-                    // SAFETY: name_buf and def_buf are null-terminated mutable buffers.
-                    // The C function copies both strings internally (dupstr), so the
-                    // buffers only need to live for the duration of this call.
-                    // file_ptr is a leaked CString valid for the process lifetime.
-                    unsafe {
-                        gnu_units_sys::newalias(
-                            name_buf.as_mut_ptr() as *mut std::os::raw::c_char,
-                            def_buf.as_mut_ptr() as *mut std::os::raw::c_char,
-                            *linenum as c_int,
-                            file_ptr,
-                            std::ptr::null_mut(),
-                        );
-                    }
+                    ffi::newalias(name, def, *linenum as c_int, file_ptr);
                     results.push(Definition {
                         name: name.to_owned(),
                         definition: def.to_owned(),
@@ -309,71 +295,15 @@ fn load_definitions_inner(
         }
 
         let name = raw_name.strip_prefix('+').unwrap_or(raw_name);
-        let redefine = 1;
-
         if name.is_empty() {
             continue;
         }
 
-        let mut name_buf: Vec<u8> = name.bytes().chain(std::iter::once(0)).collect();
-        let mut def_buf: Vec<u8> = def.bytes().chain(std::iter::once(0)).collect();
-        let mut count: c_int = 0;
-
-        let name_ptr = name_buf.as_mut_ptr() as *mut std::os::raw::c_char;
-        let def_ptr = def_buf.as_mut_ptr() as *mut std::os::raw::c_char;
-
-        // SAFETY: name_buf and def_buf are null-terminated mutable buffers.
-        // The C function copies both strings internally (dupstr), so the
-        // buffers only need to live for the duration of this call.
-        // file_ptr is a leaked CString valid for the process lifetime.
-        unsafe {
-            match name {
-                n if n.ends_with('-') => {
-                    gnu_units_sys::newprefix(
-                        name_ptr,
-                        def_ptr,
-                        &mut count,
-                        *linenum as c_int,
-                        file_ptr,
-                        std::ptr::null_mut(),
-                        redefine,
-                    );
-                }
-                n if n.contains('[') => {
-                    gnu_units_sys::newtable(
-                        name_ptr,
-                        def_ptr,
-                        &mut count,
-                        *linenum as c_int,
-                        file_ptr,
-                        std::ptr::null_mut(),
-                        redefine,
-                    );
-                }
-                n if n.contains('(') => {
-                    gnu_units_sys::newfunction(
-                        name_ptr,
-                        def_ptr,
-                        &mut count,
-                        *linenum as c_int,
-                        file_ptr,
-                        std::ptr::null_mut(),
-                        redefine,
-                    );
-                }
-                _ => {
-                    gnu_units_sys::newunit(
-                        name_ptr,
-                        def_ptr,
-                        &mut count,
-                        *linenum as c_int,
-                        file_ptr,
-                        std::ptr::null_mut(),
-                        redefine,
-                        0,
-                    );
-                }
-            }
+        match name {
+            n if n.ends_with('-') => ffi::newprefix(name, def, *linenum as c_int, file_ptr),
+            n if n.contains('[') => ffi::newtable(name, def, *linenum as c_int, file_ptr),
+            n if n.contains('(') => ffi::newfunction(name, def, *linenum as c_int, file_ptr),
+            _ => ffi::newunit(name, def, *linenum as c_int, file_ptr),
         }
 
         let kind = if name.ends_with('-') {
