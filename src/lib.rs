@@ -141,7 +141,7 @@ pub struct Unit {
 }
 
 // SAFETY: All FFI calls that read or mutate `unittype` fields are serialized
-// through `MUTEX` in `ffi.rs`. The raw pointers inside `unittype` point to
+// through `GNU_UNITS_MUTEX` in `ffi.rs`. The raw pointers inside `unittype` point to
 // C heap allocations that are only accessed under the same lock.
 unsafe impl Send for Unit {}
 unsafe impl Sync for Unit {}
@@ -712,10 +712,10 @@ pub fn reload_currency(content: &str) {
 /// ```
 pub fn convert(from: &str, to: &str) -> Result<f64> {
     ensure_db();
-    match ffi::convert_func(from, to) {
-        Some(unit) => Ok(unit.factor()),
-        _ => Unit::parse(from)?.convert_to(Unit::parse(to)?),
+    if let Some(unit) = ffi::convert_func(from, to) {
+        return Ok(unit.factor());
     }
+    Unit::parse(from)?.convert_to(Unit::parse(to)?)
 }
 
 /// Finds all unit definitions that are conformable with `expr`.
@@ -1419,65 +1419,66 @@ mod tests {
         assert!(result);
     }
 
-    #[test]
-    fn conformable_m_contains_length_units() {
-        let result = conformable("m").unwrap();
+    #[rstest]
+    #[case::m_contains_meter("m", "meter")]
+    #[case::m_contains_mile("m", "mile")]
+    #[case::m_contains_ft("m", "ft")]
+    #[case::m_contains_inch("m", "inch")]
+    #[case::kg_contains_lb("kg", "lb")]
+    #[case::kg_contains_g("kg", "g")]
+    fn conformable_contains_expected_unit(#[case] expr: &str, #[case] expected_unit: &str) {
+        let result = conformable(expr).unwrap();
 
-        // "km" is a prefix+base combination, not a standalone DB entry; use full names
         assert!(
-            result.contains(&"meter".to_string()),
-            "meter missing from {:?}",
-            result
-        );
-        assert!(
-            result.contains(&"mile".to_string()),
-            "mile missing from {:?}",
-            result
-        );
-        assert!(
-            result.contains(&"ft".to_string()),
-            "ft missing from {:?}",
-            result
-        );
-        assert!(
-            result.contains(&"inch".to_string()),
-            "inch missing from {:?}",
+            result.contains(&expected_unit.to_string()),
+            "{} missing from {:?}",
+            expected_unit,
             result
         );
     }
 
-    #[test]
-    fn conformable_m_does_not_contain_wrong_domain() {
-        let result = conformable("m").unwrap();
+    #[rstest]
+    #[case::m_not_kg("m", "kg")]
+    #[case::m_not_second("m", "second")]
+    fn conformable_does_not_contain_wrong_domain(
+        #[case] expr: &str,
+        #[case] unexpected_unit: &str,
+    ) {
+        let result = conformable(expr).unwrap();
 
-        assert!(!result.contains(&"kg".to_string()), "kg should not appear");
         assert!(
-            !result.contains(&"second".to_string()),
-            "second should not appear"
+            !result.contains(&unexpected_unit.to_string()),
+            "{} should not appear in {:?}",
+            unexpected_unit,
+            result
         );
     }
 
     #[test]
     fn error_on_conformable_invalid_expression() {
-        // ")" is an invalid token for the bison grammar → E_PARSE propagated from Unit::parse
         let result = conformable(")");
 
         assert!(result.is_err(), "expected Err for invalid expression");
     }
 
-    #[test]
-    fn conformable_kg_contains_mass_units() {
-        let result = conformable("kg").unwrap();
+    #[rstest]
+    #[case::zero_celsius("273.15 K", "tempC", 0.0, 1e-6)]
+    #[case::boiling_point_celsius("373.15 K", "tempC", 100.0, 1e-6)]
+    #[case::freezing_point_fahrenheit("273.15 K", "tempF", 32.0, 1e-4)]
+    #[case::body_temp_fahrenheit("310.15 K", "tempF", 98.6, 0.1)]
+    #[case::absolute_zero_kelvin("0 K", "tempK", 0.0, 1e-10)]
+    #[case::fallback_non_function("km", "m", 1000.0, 1e-10)]
+    fn convert_via_function(
+        #[case] from: &str,
+        #[case] to: &str,
+        #[case] expected: f64,
+        #[case] tolerance: f64,
+    ) {
+        let result = convert(from, to).unwrap();
 
         assert!(
-            result.contains(&"lb".to_string()),
-            "lb missing from {:?}",
-            result
-        );
-        assert!(
-            result.contains(&"g".to_string()),
-            "g missing from {:?}",
-            result
+            (result - expected).abs() < tolerance,
+            "convert({from:?}, {to:?}) = {result}, expected {expected} ±{tolerance}"
         );
     }
 }
