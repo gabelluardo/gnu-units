@@ -14,6 +14,7 @@ documentation = "https://docs.rs/gnu-units"
 readme = "README.md"
 categories = ["api-bindings", "mathematics"]
 keywords = ["gnu", "units", "conversion", "physics", "currency"]
+include = ["src/**", "data/**", "Cargo.toml", "README.md", "LICENSE"]
 
 [features]
 default = ["gnu-units-sys/default"]

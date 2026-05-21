@@ -33,7 +33,7 @@ pub(crate) static DEFINITIONS: LazyLock<RwLock<Vec<Definition>>> = LazyLock::new
         }
     }
 
-    let definitions = include_str!("../gnu-units-sys/vendor/units/definitions.units");
+    let definitions = include_str!("../data/definitions.units");
     let mut defs = load_definitions(definitions, c"definitions.units");
     // Emulate C last-write-wins: reverse so last-in-file entries come first
     defs.reverse();
