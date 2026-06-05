@@ -1,0 +1,31 @@
+# cargo-deny configuration for gnu-units.
+# https://embarkstudios.github.io/cargo-deny/
+
+[licenses]
+# Permit the repository's own licence and common permissive licences used by
+# transitive dependencies.
+allow = [
+    "GPL-3.0-or-later",
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "OpenSSL",
+    "LicenseRef-ring",
+]
+
+[bans]
+# Warn on duplicate versions of the same crate; error on explicitly denied crates.
+multiple-versions = "warn"
+
+[advisories]
+# Deny crates with known security vulnerabilities.
+db-urls = ["https://github.com/rustsec/advisory-db"]
+ignore = []
+
+[sources]
+# Only allow crates from crates.io and the local workspace.
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
