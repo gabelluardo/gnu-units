@@ -19,16 +19,8 @@ env:
 
 jobs:
     rust-sanity:
-        name: "Rust: Code sanity (${{ matrix.features }})"
+        name: "Rust: Code sanity"
         runs-on: ubuntu-latest
-        strategy:
-            fail-fast: false
-            matrix:
-                features:
-                    - ""
-                    - "--features currency-update"
-                    - "--no-default-features --features vendored"
-                    - "--no-default-features --features vendored,currency-update"
         steps:
             - uses: canonical/desktop-engineering/gh-actions/common/dpkg-install-speedup@main
             - uses: actions/checkout@v4
@@ -40,22 +32,37 @@ jobs:
             - name: Check formatting
               run: cargo fmt --all -- --check
             - name: Clippy
-              run: cargo clippy --workspace ${{ matrix.features }} -- -D warnings
+              run: |
+                  set -euo pipefail
+                  combos=(
+                      ""
+                      "--features currency-update"
+                      "--no-default-features --features vendored"
+                      "--no-default-features --features vendored,currency-update"
+                  )
+                  for features in "${combos[@]}"; do
+                      echo "::group::clippy ${features:-(default)}"
+                      cargo clippy --workspace $features -- -D warnings
+                      echo "::endgroup::"
+                  done
             - name: Clippy (tests)
-              run: cargo clippy --workspace --tests ${{ matrix.features }} -- -D warnings
+              run: |
+                  set -euo pipefail
+                  combos=(
+                      ""
+                      "--features currency-update"
+                      "--no-default-features --features vendored"
+                      "--no-default-features --features vendored,currency-update"
+                  )
+                  for features in "${combos[@]}"; do
+                      echo "::group::clippy --tests ${features:-(default)}"
+                      cargo clippy --workspace --tests $features -- -D warnings
+                      echo "::endgroup::"
+                  done
 
     rust-tests:
-        name: "Rust: Tests and coverage (${{ matrix.features }})"
+        name: "Rust: Tests and coverage"
         runs-on: ubuntu-latest
-        strategy:
-            fail-fast: false
-            matrix:
-                features:
-                    - ""
-                    - "--features currency-update"
-                    - "--no-default-features --features vendored"
-                    - "--no-default-features --features vendored,bindgen"
-                    - "--no-default-features --features vendored,currency-update"
         steps:
             - uses: canonical/desktop-engineering/gh-actions/common/dpkg-install-speedup@main
             - uses: actions/checkout@v4
@@ -68,13 +75,25 @@ jobs:
                   tool: nextest,cargo-llvm-cov
             - name: Install Rust stable toolchain
               run: rustup update stable
-            - name: Run tests
-              run: cargo nextest run --workspace ${{ matrix.features }}
+            - name: Tests
+              run: |
+                  set -euo pipefail
+                  combos=(
+                      ""
+                      "--features currency-update"
+                      "--no-default-features --features vendored"
+                      "--no-default-features --features vendored,bindgen"
+                      "--no-default-features --features vendored,currency-update"
+                  )
+                  for features in "${combos[@]}"; do
+                      echo "::group::nextest ${features:-(default)}"
+                      cargo nextest run --workspace $features
+                      echo "::endgroup::"
+                  done
             - name: Collect coverage
               run: |
                   cargo llvm-cov nextest \
                     --workspace \
-                    ${{ matrix.features }} \
                     --ignore-filename-regex "_test\.rs$" \
                     --lcov \
                     --output-path lcov.info
