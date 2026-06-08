@@ -5,8 +5,8 @@
 
 use std::collections::HashMap;
 
+use crate::ErrorCode;
 use crate::UnitsError;
-use crate::error_codes as E;
 
 use super::database;
 use super::parser::{ParseError, parseunit as parser_parseunit, parseunit_with_vars};
@@ -14,36 +14,14 @@ use super::types::UnitValue;
 
 pub(crate) type RawUnit = UnitValue;
 
-fn parse_err() -> UnitsError {
-    UnitsError { code: E::E_PARSE }
-}
-
-fn unknown_unit_err() -> UnitsError {
-    UnitsError {
-        code: E::E_UNKNOWNUNIT,
-    }
-}
-
-fn not_a_number_err() -> UnitsError {
-    UnitsError {
-        code: E::E_NOTANUMBER,
-    }
-}
-
-fn bad_sum_err() -> UnitsError {
-    UnitsError { code: E::E_BADSUM }
-}
-
-fn not_root_err() -> UnitsError {
-    UnitsError { code: E::E_NOTROOT }
-}
-
 fn map_parse(e: ParseError) -> UnitsError {
-    if e.0.contains("unknown unit") {
-        return unknown_unit_err();
+    match e {
+        ParseError::UnknownUnit(_) => UnitsError(ErrorCode::UnknownUnit),
+        ParseError::NotInDomain { .. } => UnitsError(ErrorCode::NotInDomain),
+        ParseError::WrongDimensions { .. } => UnitsError(ErrorCode::BadFuncArg),
+        ParseError::IrrationalExponent => UnitsError(ErrorCode::IrrationalExponent),
+        _ => UnitsError(ErrorCode::Parse),
     }
-
-    parse_err()
 }
 
 pub(crate) fn unit_new() -> RawUnit {
@@ -74,7 +52,7 @@ pub(crate) fn unit_divide(lhs: &mut RawUnit, rhs: &RawUnit) -> crate::Result<()>
 
 pub(crate) fn unit_add(lhs: &mut RawUnit, rhs: &RawUnit) -> crate::Result<()> {
     if !lhs.add_assign(rhs) {
-        return Err(bad_sum_err());
+        return Err(UnitsError(ErrorCode::BadSum));
     }
     Ok(())
 }
@@ -85,7 +63,7 @@ pub(crate) fn unit_invert(unit: &mut RawUnit) {
 
 pub(crate) fn unit_pow(unit: &mut RawUnit, power: i32) -> crate::Result<()> {
     if power < 0 {
-        return Err(UnitsError { code: E::E_BADNUM });
+        return Err(UnitsError(ErrorCode::BadNum));
     }
     unit.pow_assign(power);
     Ok(())
@@ -93,17 +71,17 @@ pub(crate) fn unit_pow(unit: &mut RawUnit, power: i32) -> crate::Result<()> {
 
 pub(crate) fn unit_root(unit: &mut RawUnit, n: i32) -> crate::Result<()> {
     if n <= 0 {
-        return Err(not_root_err());
+        return Err(UnitsError(ErrorCode::NotRoot));
     }
     if !unit.root_assign(n) {
-        return Err(not_root_err());
+        return Err(UnitsError(ErrorCode::NotRoot));
     }
     Ok(())
 }
 
 pub(crate) fn unit_to_number(unit: &RawUnit) -> crate::Result<f64> {
     if !unit.is_dimensionless() {
-        return Err(not_a_number_err());
+        return Err(UnitsError(ErrorCode::NotANumber));
     }
     Ok(unit.factor)
 }
@@ -121,13 +99,16 @@ pub(crate) fn unit_clone(src: &RawUnit) -> RawUnit {
 #[inline]
 pub(crate) fn unit_drop(_unit: &mut RawUnit) {}
 
-pub(crate) fn convert_func(from: &str, to: &str) -> Option<f64> {
+pub(crate) fn convert_func(from: &str, to: &str) -> crate::Result<f64> {
     enum FuncLookup {
         Function(String),
         Table(String),
     }
 
-    let from_val = parser_parseunit(from).ok()?;
+    let from_val = match parser_parseunit(from) {
+        Ok(v) => v,
+        Err(e) => return Err(map_parse(e)),
+    };
 
     let lookup = {
         let db = database::read();
@@ -142,22 +123,30 @@ pub(crate) fn convert_func(from: &str, to: &str) -> Option<f64> {
         }
     };
 
-    match lookup? {
+    let lookup = lookup.ok_or(UnitsError(ErrorCode::NotAFunc))?;
+
+    match lookup {
         FuncLookup::Function(reverse) => {
             let vars = HashMap::from([(to.to_owned(), from_val)]);
-            let result = parseunit_with_vars(&reverse, &vars).ok()?;
-            Some(result.factor)
+            parseunit_with_vars(&reverse, &vars)
+                .map(|v| v.factor)
+                .map_err(map_parse)
         }
         FuncLookup::Table(unit_expr) => {
-            let unit_val = parser_parseunit(&unit_expr).ok()?;
+            let unit_val = match parser_parseunit(&unit_expr) {
+                Ok(v) => v,
+                Err(e) => return Err(map_parse(e)),
+            };
             let mut ratio = from_val;
             ratio.divide_assign(&unit_val);
             if !ratio.is_dimensionless() {
-                return None;
+                return Err(UnitsError(ErrorCode::NotInDomain));
             }
             let db = database::read();
-            let table = db.tables.get(to)?;
-            table.reverse_interpolate(ratio.factor)
+            let table = db.tables.get(to).ok_or(UnitsError(ErrorCode::NotAFunc))?;
+            table
+                .reverse_interpolate(ratio.factor)
+                .ok_or(UnitsError(ErrorCode::NotInDomain))
         }
     }
 }

@@ -20,7 +20,7 @@ gnu-units = "0.1"
 ```
 
 ```rust
-use gnu_units::{convert, parse, conformable, Unit};
+use gnu_units::{convert, parse, conformable, Unit, ErrorCode, UnitsError};
 
 // Simple conversion factor
 let factor = convert("km", "miles").unwrap();
@@ -42,6 +42,14 @@ assert!(a.is_conformable(&b));
 // Find all conformable units
 let lengths = conformable("m").unwrap();
 assert!(lengths.contains(&"mile".to_string()));
+
+// Error handling with ErrorCode
+let err = Unit::parse("???").unwrap_err();
+match err.code() {
+    ErrorCode::Parse => println!("parse error"),
+    ErrorCode::UnknownUnit => println!("unknown unit"),
+    _ => println!("other error: {err}"),
+}
 ```
 
 ## Optional features

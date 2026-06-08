@@ -1,202 +1,233 @@
-//! Pure-Rust expression parser for GNU units expressions.
+//! Pure-Rust expression parser for GNU units expressions, backed by [`pest`].
 //!
-//! Grammar (lowest → highest precedence):
+//! The PEG grammar lives in `parser.pest` (same directory).
 //!
+//! Operator precedence (lowest → highest):
 //! ```text
-//! expr     ::= additive
-//! additive ::= product (('+' | '-') product)*
-//! product  ::= power (('*' | '/' | '|' | <juxtaposition>) power)*
-//! power    ::= unary ('^' | '**') signed_integer
-//! unary    ::= ('-' | '+') unary | atom
-//! atom     ::= NUMBER | NAME ('(' expr ')')? | '(' expr ')'
+//! additive  ::= product (('+' | '-' | '+-') product)*
+//! product   ::= power (('*' | '/' | 'per' | <juxtaposition>) power)*
+//!               ('|' requires both operands to be dimensionless)
+//! power     ::= unary ('^' | '**') unary
+//! unary     ::= ('-' | 'per') unary | atom
+//! atom      ::= NUMBER | '~' NAME '(' expr ')' | NAME '(' expr ')' | NAME | '(' expr ')'
 //! ```
-//!
-//! The `|` operator is equivalent to `/` (reciprocal fraction).  Adjacent
-//! tokens (juxtaposition) imply multiplication.  Powers associate left to right
-//! with multiplication / division.
 
 use std::collections::{HashMap, HashSet};
 
+use pest::{Parser, iterators::Pair};
+use pest_derive::Parser;
+
 use super::database::{Database, FunctionDef, UnitEntry, read as db_read};
-use super::types::UnitValue;
+use super::types::{UnitValue, float2rat};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ParseError(pub String);
+#[derive(Parser)]
+#[grammar = "engine/native/parser.pest"]
+struct UnitParser;
 
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "parse error: {}", self.0)
-    }
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum ParseError {
+    #[error("unknown unit: {0}")]
+    UnknownUnit(String),
+
+    #[error("{func}: argument {arg} not in domain")]
+    NotInDomain { func: String, arg: usize },
+
+    #[error("{func}: argument {arg} has wrong dimensions")]
+    WrongDimensions { func: String, arg: usize },
+
+    #[error("irrational exponent for dimensional unit")]
+    IrrationalExponent,
+
+    #[error("incompatible dimensions in {0}")]
+    IncompatibleDimensions(&'static str),
+
+    #[error("{0}: argument must be dimensionless")]
+    DimensionlessRequired(String),
+
+    #[error("{func}: {reason}")]
+    Undefined {
+        func: &'static str,
+        reason: &'static str,
+    },
+
+    #[error("{func}: {constraint}")]
+    OutOfRange {
+        func: &'static str,
+        constraint: &'static str,
+    },
+
+    #[error("circular definition: {0}")]
+    CircularDefinition(String),
+
+    #[error("expression too deeply nested")]
+    TooDeep,
+
+    #[error("max recursion depth while resolving: {0}")]
+    MaxRecursion(String),
+
+    #[error("invalid number: {0}")]
+    InvalidNumber(String),
+
+    #[error("empty expression")]
+    EmptyExpression,
+
+    #[error("{func}: expected {expected} argument(s), got {got}")]
+    ArityMismatch {
+        func: String,
+        expected: usize,
+        got: usize,
+    },
+
+    #[error("function has no inverse: {0}")]
+    NoInverse(String),
+
+    #[error("{func}: inverse not supported for zero-arg or multivariate functions")]
+    InverseNotSupported { func: String },
+
+    #[error("base unit not divisible by root")]
+    NotDivisibleByRoot,
+
+    #[error("exponent must be dimensionless")]
+    ExponentNotDimensionless,
+
+    #[error("{0}")]
+    Grammar(String),
 }
 
-#[derive(Debug, Clone, PartialEq)]
-enum Token {
-    Num(f64),
-    Name(String),
-    Star,
-    Slash,
-    Pipe,
-    Caret,
-    LParen,
-    RParen,
-    Minus,
-    Plus,
-    Tilde,
-    PlusMinus,
-    Eof,
+/// Maps a pest parse error to [`ParseError`], translating EOI failures into
+/// the "unexpected trailing input" message expected by callers and tests.
+fn map_pest_error(e: pest::error::Error<Rule>) -> ParseError {
+    if let pest::error::ErrorVariant::ParsingError { ref positives, .. } = e.variant
+        && positives.contains(&Rule::EOI)
+    {
+        return ParseError::Grammar("unexpected trailing input".to_owned());
+    }
+    ParseError::Grammar(e.to_string())
 }
 
-fn tokenize(input: &str) -> Result<Vec<Token>, ParseError> {
-    let bytes = input.as_bytes();
-    let mut tokens = Vec::new();
-    let mut i = 0;
-
-    while i < bytes.len() {
-        match bytes[i] {
-            b' ' | b'\t' | b'\n' | b'\r' => {
-                i += 1;
-            }
-            b'*' => {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'*' {
-                    tokens.push(Token::Caret);
-                    i += 2;
-                } else {
-                    tokens.push(Token::Star);
-                    i += 1;
-                }
-            }
-            b'/' => {
-                tokens.push(Token::Slash);
-                i += 1;
-            }
-            b'^' => {
-                tokens.push(Token::Caret);
-                i += 1;
-            }
-            b'|' => {
-                tokens.push(Token::Pipe);
-                i += 1;
-            }
-            b'(' => {
-                tokens.push(Token::LParen);
-                i += 1;
-            }
-            b')' => {
-                tokens.push(Token::RParen);
-                i += 1;
-            }
-            b'-' => {
-                tokens.push(Token::Minus);
-                i += 1;
-            }
-            b'+' => {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'-' {
-                    tokens.push(Token::PlusMinus);
-                    i += 2;
-                } else {
-                    tokens.push(Token::Plus);
-                    i += 1;
-                }
-            }
-            b'0'..=b'9' | b'.' => {
-                let start = i;
-                if bytes[i] == b'0'
-                    && i + 1 < bytes.len()
-                    && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X')
-                {
-                    i += 2;
-                    while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
-                        i += 1;
-                    }
-                    let hex = &input[start + 2..i];
-                    let val = i64::from_str_radix(hex, 16)
-                        .map_err(|_| ParseError("invalid hex literal".to_owned()))?;
-                    tokens.push(Token::Num(val as f64));
-                } else {
-                    while i < bytes.len() && bytes[i].is_ascii_digit() {
-                        i += 1;
-                    }
-                    if i < bytes.len() && bytes[i] == b'.' {
-                        i += 1;
-                        while i < bytes.len() && bytes[i].is_ascii_digit() {
-                            i += 1;
-                        }
-                    }
-                    // Scientific notation — only consume e/E when followed by
-                    // sign+digits or digits, so "eV" isn't swallowed.
-                    if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
-                        let mut j = i + 1;
-                        if j < bytes.len() && (bytes[j] == b'+' || bytes[j] == b'-') {
-                            j += 1;
-                        }
-                        if j < bytes.len() && bytes[j].is_ascii_digit() {
-                            i = j;
-                            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                                i += 1;
-                            }
-                        }
-                    }
-                    let num_str = &input[start..i];
-                    let val: f64 = num_str
-                        .parse()
-                        .map_err(|_| ParseError(format!("invalid number: {num_str}")))?;
-                    tokens.push(Token::Num(val));
-                }
-            }
-            b if b.is_ascii_alphabetic()
-                || b == b'_'
-                || b == b'%'
-                || b == b'$'
-                || b == b'&'
-                || !b.is_ascii() =>
-            {
-                let start = i;
-                i += 1;
-                while i < bytes.len()
-                    && (bytes[i].is_ascii_alphanumeric()
-                        || bytes[i] == b'_'
-                        || bytes[i] == b'\''
-                        || bytes[i] == b'$'
-                        || bytes[i] == b'&'
-                        || !bytes[i].is_ascii())
-                {
-                    i += 1;
-                }
-                tokens.push(Token::Name(input[start..i].to_owned()));
-            }
-            b'~' => {
-                tokens.push(Token::Tilde);
-                i += 1;
-            }
-            _ => {
-                let ch = input[i..].chars().next().unwrap_or('?');
-                return Err(ParseError(format!("unexpected character: '{ch}'")));
-            }
-        }
-    }
-
-    tokens.push(Token::Eof);
-    Ok(tokens)
+/// Parses `input` as a `Rule::input` and returns the inner `Rule::expr` pair.
+fn parse_to_expr_pair(input: &str) -> Result<Pair<'_, Rule>, ParseError> {
+    let mut pairs = UnitParser::parse(Rule::input, input).map_err(map_pest_error)?;
+    let Some(input_pair) = pairs.next() else {
+        return Err(ParseError::Grammar("expected input pair".to_owned()));
+    };
+    let Some(expr_pair) = input_pair.into_inner().find(|p| p.as_rule() == Rule::expr) else {
+        return Err(ParseError::Grammar("expected expression".to_owned()));
+    };
+    Ok(expr_pair)
 }
 
 const MAX_DEPTH: usize = 256;
 
-struct Parser<'db> {
-    tokens: Vec<Token>,
-    pos: usize,
+struct Evaluator<'db> {
     db: &'db Database,
     /// Variable bindings used when evaluating function bodies.
     vars: HashMap<String, UnitValue>,
-    /// Set of unit names currently being resolved (cycle detection).
+    /// Unit names currently being resolved (cycle detection).
     resolving: HashSet<String>,
     depth: usize,
 }
 
-impl<'db> Parser<'db> {
-    fn new(tokens: Vec<Token>, db: &'db Database) -> Self {
+/// Applies `base ^ exp`, replicating `unitpower` from the GNU units C source.
+///
+/// - Exponent must be dimensionless; otherwise an error is returned.
+/// - Dimensionless base: `factor = factor.powf(exp.factor)`.
+/// - Dimensional base: exponent is approximated as `p/q` via continued fractions
+///   (`float2rat`).  If not rational, an error is returned.  If `q != 1`,
+///   `root_assign(q)` is applied first.  Then `pow_assign(|p|)`, and if `p < 0`
+///   the result is inverted.
+fn apply_power(mut base: UnitValue, exp: UnitValue) -> Result<UnitValue, ParseError> {
+    if !exp.is_dimensionless() {
+        return Err(ParseError::ExponentNotDimensionless);
+    }
+    if base.is_dimensionless() {
+        base.factor = base.factor.powf(exp.factor);
+        return Ok(base);
+    }
+    let Some((p, q)) = float2rat(exp.factor) else {
+        return Err(ParseError::IrrationalExponent);
+    };
+    if q != 1 && !base.root_assign(q) {
+        return Err(ParseError::NotDivisibleByRoot);
+    }
+    base.pow_assign(p.unsigned_abs() as i32);
+    if p < 0 {
+        base.invert();
+    }
+    Ok(base)
+}
+
+/// Checks that `arg` is dimensionless; returns an error mentioning `name` otherwise.
+fn require_dimensionless(name: &str, arg: &UnitValue) -> Result<(), ParseError> {
+    if !arg.is_dimensionless() {
+        return Err(ParseError::DimensionlessRequired(name.to_owned()));
+    }
+    Ok(())
+}
+
+/// Returns `true` iff `a` and `b` have the same non-zero dimension exponents.
+fn are_conformable(a: &UnitValue, b: &UnitValue) -> bool {
+    let a_dims: std::collections::HashMap<&String, i32> = a
+        .dimensions
+        .iter()
+        .filter(|(_, v)| **v != 0)
+        .map(|(k, v)| (k, *v))
+        .collect();
+    let b_dims: std::collections::HashMap<&String, i32> = b
+        .dimensions
+        .iter()
+        .filter(|(_, v)| **v != 0)
+        .map(|(k, v)| (k, *v))
+        .collect();
+    a_dims == b_dims
+}
+
+/// Error function approximation — Abramowitz & Stegun §7.1.26, max |ε| ≤ 1.5×10⁻⁷.
+fn erf_approx(x: f64) -> f64 {
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let x = x.abs();
+    let t = 1.0 / (1.0 + 0.327_591_1 * x);
+    let poly = t
+        * (0.254_829_592
+            + t * (-0.284_496_736
+                + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
+    sign * (1.0 - poly * (-x * x).exp())
+}
+
+/// Lanczos approximation of Γ(x) with g = 7 (≈15 significant digits).
+/// Returns ±∞ at poles (non-positive integers).
+fn gamma_lanczos(x: f64) -> f64 {
+    const G: f64 = 7.0;
+    const P: [f64; 9] = [
+        0.999_999_999_999_809_9,
+        676.520_368_121_885_1,
+        -1_259.139_216_722_402_8,
+        771.323_428_777_653_1,
+        -176.615_029_162_140_6,
+        12.507_343_278_686_9,
+        -0.138_571_095_265_720_12,
+        9.984_369_578_019_572e-6,
+        1.505_632_735_149_311_6e-7,
+    ];
+    if x < 0.5 {
+        let denom = (std::f64::consts::PI * x).sin() * gamma_lanczos(1.0 - x);
+        if denom == 0.0 {
+            return f64::INFINITY;
+        }
+        return std::f64::consts::PI / denom;
+    }
+    let z = x - 1.0;
+    let mut a = P[0];
+    for (i, &pi) in P[1..].iter().enumerate() {
+        a += pi / (z + (i as f64) + 1.0);
+    }
+    let t = z + G + 0.5;
+    (2.0 * std::f64::consts::PI).sqrt() * t.powf(z + 0.5) * (-t).exp() * a
+}
+
+impl<'db> Evaluator<'db> {
+    fn new(db: &'db Database) -> Self {
         Self {
-            tokens,
-            pos: 0,
             db,
             vars: HashMap::new(),
             resolving: HashSet::new(),
@@ -204,224 +235,223 @@ impl<'db> Parser<'db> {
         }
     }
 
-    fn peek(&self) -> &Token {
-        &self.tokens[self.pos]
+    fn eval_expr(&mut self, pair: Pair<Rule>) -> Result<UnitValue, ParseError> {
+        let Some(inner) = pair.into_inner().next() else {
+            return Err(ParseError::Grammar("expected additive child".to_owned()));
+        };
+        self.eval_additive(inner)
     }
 
-    fn advance(&mut self) -> Token {
-        let t = self.tokens[self.pos].clone();
-        if self.pos + 1 < self.tokens.len() {
-            self.pos += 1;
+    /// Increments the recursion depth, evaluates `pair` as an expression, then
+    /// decrements depth — even on error, ensuring consistent state.
+    fn eval_nested(&mut self, pair: Pair<Rule>) -> Result<UnitValue, ParseError> {
+        if self.depth >= MAX_DEPTH {
+            return Err(ParseError::TooDeep);
         }
-        t
+        self.depth += 1;
+        let result = self.eval_expr(pair);
+        self.depth -= 1;
+        result
     }
 
-    /// True when the current token can start a multiplicative factor
-    /// (triggering juxtaposition multiplication).
-    fn can_start_factor(&self) -> bool {
-        matches!(
-            self.peek(),
-            Token::Num(_) | Token::Name(_) | Token::LParen | Token::Tilde
-        )
-    }
+    fn eval_additive(&mut self, pair: Pair<Rule>) -> Result<UnitValue, ParseError> {
+        let mut inner = pair.into_inner();
+        let Some(first) = inner.next() else {
+            return Err(ParseError::Grammar("expected first product".to_owned()));
+        };
+        let mut result = self.eval_product(first)?;
 
-    fn parse_expr(&mut self) -> Result<UnitValue, ParseError> {
-        self.parse_additive()
-    }
+        while let Some(op_pair) = inner.next() {
+            let op = op_pair.as_str();
+            let Some(rhs_pair) = inner.next() else {
+                return Err(ParseError::Grammar("expected rhs product".to_owned()));
+            };
+            let rhs = self.eval_product(rhs_pair)?;
+            if op == "+" {
+                if !result.add_assign(&rhs) {
+                    return Err(ParseError::IncompatibleDimensions("addition"));
+                }
+                continue;
+            }
 
-    fn parse_additive(&mut self) -> Result<UnitValue, ParseError> {
-        let mut lhs = self.parse_product()?;
-        loop {
-            match self.peek() {
-                Token::Plus => {
-                    self.advance();
-                    let rhs = self.parse_product()?;
-                    if !lhs.add_assign(&rhs) {
-                        return Err(ParseError("incompatible dimensions in addition".to_owned()));
-                    }
-                }
-                Token::Minus => {
-                    self.advance();
-                    let mut rhs = self.parse_product()?;
-                    rhs.factor = -rhs.factor;
-                    if !lhs.add_assign(&rhs) {
-                        return Err(ParseError(
-                            "incompatible dimensions in subtraction".to_owned(),
-                        ));
-                    }
-                }
-                Token::PlusMinus => {
-                    self.advance();
-                    let mut rhs = self.parse_product()?;
-                    rhs.factor = -rhs.factor;
-                    if !lhs.add_assign(&rhs) {
-                        return Err(ParseError(
-                            "incompatible dimensions in subtraction".to_owned(),
-                        ));
-                    }
-                }
-                _ => break,
+            let mut neg = rhs;
+            neg.factor = -neg.factor;
+            if !result.add_assign(&neg) {
+                return Err(ParseError::IncompatibleDimensions("subtraction"));
             }
         }
-        Ok(lhs)
+        Ok(result)
     }
 
-    fn parse_product(&mut self) -> Result<UnitValue, ParseError> {
-        let mut lhs = self.parse_power()?;
+    fn eval_product(&mut self, pair: Pair<Rule>) -> Result<UnitValue, ParseError> {
+        let mut inner = pair.into_inner();
+        let Some(first) = inner.next() else {
+            return Err(ParseError::Grammar("expected first power".to_owned()));
+        };
+        let mut result = self.eval_power(first)?;
 
-        loop {
-            match self.peek() {
-                Token::Star => {
-                    self.advance();
-                    let rhs = self.parse_power()?;
-                    lhs.multiply_assign(&rhs);
+        while let Some(next) = inner.next() {
+            match next.as_rule() {
+                Rule::mul_op => {
+                    let op = next.as_str();
+                    let Some(rhs_pair) = inner.next() else {
+                        return Err(ParseError::Grammar("expected rhs power".to_owned()));
+                    };
+                    let rhs = self.eval_power(rhs_pair)?;
+                    if op == "/" || op == "per" {
+                        result.divide_assign(&rhs);
+                    } else if op == "|" {
+                        if !result.is_dimensionless() || !rhs.is_dimensionless() {
+                            return Err(ParseError::DimensionlessRequired("|".to_owned()));
+                        }
+                        result.divide_assign(&rhs);
+                    } else {
+                        result.multiply_assign(&rhs);
+                    }
                 }
-                Token::Slash => {
-                    self.advance();
-                    let rhs = self.parse_power()?;
-                    lhs.divide_assign(&rhs);
+                Rule::juxt_factor => {
+                    let Some(inner_power) = next.into_inner().next() else {
+                        return Err(ParseError::Grammar(
+                            "expected power in juxt_factor".to_owned(),
+                        ));
+                    };
+                    if result.is_dimensionless() && result.factor == 0.0 {
+                        match self.eval_power(inner_power) {
+                            Ok(rhs) => result.multiply_assign(&rhs),
+                            Err(ParseError::UnknownUnit(_)) => {}
+                            Err(e) => return Err(e),
+                        }
+                        continue;
+                    }
+
+                    let rhs = self.eval_power(inner_power)?;
+                    result.multiply_assign(&rhs);
                 }
-                Token::Pipe => {
-                    self.advance();
-                    let rhs = self.parse_power()?;
-                    lhs.divide_assign(&rhs);
-                }
-                // Juxtaposition
-                _ if self.can_start_factor() => {
-                    let rhs = self.parse_power()?;
-                    lhs.multiply_assign(&rhs);
-                }
-                _ => break,
+                _ => unreachable!("unexpected rule in product: {:?}", next.as_rule()),
             }
         }
-
-        Ok(lhs)
+        Ok(result)
     }
 
-    fn parse_power(&mut self) -> Result<UnitValue, ParseError> {
-        let mut base = self.parse_unary()?;
+    fn eval_power(&mut self, pair: Pair<Rule>) -> Result<UnitValue, ParseError> {
+        let mut inner = pair.into_inner();
+        let Some(base_pair) = inner.next() else {
+            return Err(ParseError::Grammar("expected unary base".to_owned()));
+        };
+        let base = self.eval_unary(base_pair)?;
 
-        while matches!(self.peek(), Token::Caret) {
-            self.advance();
-            let neg = if matches!(self.peek(), Token::Minus) {
-                self.advance();
-                true
-            } else {
-                if matches!(self.peek(), Token::Plus) {
-                    self.advance();
-                }
-                false
+        if let Some(_pow_op) = inner.next() {
+            let Some(exp_pair) = inner.next() else {
+                return Err(ParseError::Grammar("expected exponent".to_owned()));
             };
-            let exp = match self.advance() {
-                Token::Num(n) => {
-                    if (n - n.round()).abs() > f64::EPSILON {
-                        return Err(ParseError(format!("exponent must be an integer, got {n}")));
-                    }
-                    let e = n.round() as i32;
-                    if neg { -e } else { e }
-                }
-                _ => return Err(ParseError("expected integer after '^'".to_owned())),
-            };
-            base.pow_assign(exp);
+            let exp = self.eval_unary(exp_pair)?;
+            return apply_power(base, exp);
         }
-
         Ok(base)
     }
 
-    fn parse_unary(&mut self) -> Result<UnitValue, ParseError> {
-        if matches!(self.peek(), Token::Minus) {
-            self.advance();
-            let mut v = self.parse_unary()?;
-            v.factor = -v.factor;
-            return Ok(v);
-        }
-        if matches!(self.peek(), Token::Plus) {
-            self.advance();
-            return self.parse_unary();
-        }
-        self.parse_atom()
-    }
-
-    fn parse_atom(&mut self) -> Result<UnitValue, ParseError> {
-        match self.peek().clone() {
-            Token::Num(n) => {
-                self.advance();
-                Ok(UnitValue::from_factor(n))
-            }
-            Token::Name(name) => {
-                self.advance();
-                if matches!(self.peek(), Token::LParen) {
-                    self.advance(); // consume '('
-                    if self.depth >= MAX_DEPTH {
-                        return Err(ParseError("expression too deeply nested".to_owned()));
-                    }
-                    self.depth += 1;
-                    let arg = self.parse_expr()?;
-                    self.depth -= 1;
-                    if !matches!(self.peek(), Token::RParen) {
-                        return Err(ParseError("expected ')'".to_owned()));
-                    }
-                    self.advance(); // consume ')'
-                    self.call_function(&name, arg)
-                } else {
-                    self.resolve_name(&name)
-                }
-            }
-            Token::LParen => {
-                self.advance();
-                if self.depth >= MAX_DEPTH {
-                    return Err(ParseError("expression too deeply nested".to_owned()));
-                }
-                self.depth += 1;
-                let v = self.parse_expr()?;
-                self.depth -= 1;
-                if !matches!(self.peek(), Token::RParen) {
-                    return Err(ParseError("expected ')'".to_owned()));
-                }
-                self.advance(); // consume ')'
+    fn eval_unary(&mut self, pair: Pair<Rule>) -> Result<UnitValue, ParseError> {
+        let mut inner = pair.into_inner();
+        let Some(first) = inner.next() else {
+            return Err(ParseError::Grammar("expected unary child".to_owned()));
+        };
+        match first.as_rule() {
+            Rule::minus => {
+                let Some(rhs) = inner.next() else {
+                    return Err(ParseError::Grammar("expected unary operand".to_owned()));
+                };
+                let mut v = self.eval_unary(rhs)?;
+                v.factor = -v.factor;
                 Ok(v)
             }
-            Token::Tilde => {
-                self.advance();
-                match self.peek().clone() {
-                    Token::Name(name) => {
-                        self.advance();
-                        if !matches!(self.peek(), Token::LParen) {
-                            return Err(ParseError("expected '(' after ~function".to_owned()));
-                        }
-                        self.advance(); // consume '('
-                        if self.depth >= MAX_DEPTH {
-                            return Err(ParseError("expression too deeply nested".to_owned()));
-                        }
-                        self.depth += 1;
-                        let arg = self.parse_expr()?;
-                        self.depth -= 1;
-                        if !matches!(self.peek(), Token::RParen) {
-                            return Err(ParseError("expected ')'".to_owned()));
-                        }
-                        self.advance(); // consume ')'
-                        self.call_inverse_function(&name, arg)
-                    }
-                    _ => Err(ParseError("expected function name after '~'".to_owned())),
-                }
+            Rule::per => {
+                let Some(rhs) = inner.next() else {
+                    return Err(ParseError::Grammar("expected operand after per".to_owned()));
+                };
+                let mut v = self.eval_unary(rhs)?;
+                v.invert();
+                Ok(v)
             }
-            Token::Eof => Err(ParseError("unexpected end of expression".to_owned())),
-            other => Err(ParseError(format!("unexpected token: {other:?}"))),
+            Rule::atom => self.eval_atom(first),
+            _ => unreachable!("unexpected rule in unary: {:?}", first.as_rule()),
         }
+    }
+
+    fn eval_atom(&mut self, pair: Pair<Rule>) -> Result<UnitValue, ParseError> {
+        let Some(child) = pair.into_inner().next() else {
+            return Err(ParseError::Grammar("expected atom child".to_owned()));
+        };
+        match child.as_rule() {
+            Rule::number => {
+                let Some(num_inner) = child.into_inner().next() else {
+                    return Err(ParseError::Grammar("expected number inner".to_owned()));
+                };
+                let text = num_inner.as_str();
+                let val: f64 = match num_inner.as_rule() {
+                    Rule::hex_number => {
+                        let hex = &text[2..];
+                        i64::from_str_radix(hex, 16).map_err(|_| {
+                            ParseError::InvalidNumber("invalid hex literal".to_owned())
+                        })? as f64
+                    }
+                    Rule::decimal_number => text
+                        .parse()
+                        .map_err(|_| ParseError::InvalidNumber(text.to_owned()))?,
+                    _ => unreachable!(),
+                };
+                Ok(UnitValue::from_factor(val))
+            }
+            Rule::tilde_call => {
+                let mut tc = child.into_inner();
+                let Some(name_pair) = tc.next() else {
+                    return Err(ParseError::Grammar("expected tilde_call name".to_owned()));
+                };
+                let name = name_pair.as_str().to_owned();
+                let Some(expr_pair) = tc.next() else {
+                    return Err(ParseError::Grammar("expected tilde_call expr".to_owned()));
+                };
+                let arg = self.eval_nested(expr_pair)?;
+                self.call_inverse_function(&name, arg)
+            }
+            Rule::func_call => {
+                let mut fc = child.into_inner();
+                let Some(name_pair) = fc.next() else {
+                    return Err(ParseError::Grammar("expected func_call name".to_owned()));
+                };
+                let name = name_pair.as_str().to_owned();
+                let mut args: Vec<UnitValue> = Vec::new();
+                if let Some(arg_list_pair) = fc.next() {
+                    for expr_pair in arg_list_pair.into_inner() {
+                        args.push(self.eval_nested(expr_pair)?);
+                    }
+                }
+                self.call_function_multi(&name, args)
+            }
+            Rule::name => self.resolve_name(child.as_str()),
+            Rule::group => {
+                let Some(expr_pair) = child.into_inner().next() else {
+                    return Err(ParseError::Grammar("expected group expr".to_owned()));
+                };
+                self.eval_nested(expr_pair)
+            }
+            _ => unreachable!("unexpected rule in atom: {:?}", child.as_rule()),
+        }
+    }
+
+    fn parse_sub(&mut self, expr: &str) -> Result<UnitValue, ParseError> {
+        let expr_pair = parse_to_expr_pair(expr)?;
+        self.eval_expr(expr_pair)
     }
 
     fn resolve_name(&mut self, name: &str) -> Result<UnitValue, ParseError> {
-        // Variable binding (function parameter or injected constant).
         if let Some(val) = self.vars.get(name) {
             return Ok(val.clone());
         }
 
-        // Direct unit lookup.
         if let Some(entry) = self.db.units.get(name).cloned() {
             return self.resolve_entry(name, entry);
         }
 
-        // Plural stripping: try common English plural suffixes.
         if name.len() > 3 {
             let candidates: Vec<String> = if let Some(base) = name.strip_suffix("ies") {
                 vec![format!("{base}y")]
@@ -439,13 +469,11 @@ impl<'db> Parser<'db> {
             }
         }
 
-        // A bare prefix name used standalone (e.g. "kilo" from "k-   kilo").
         if let Some(prefix_def) = self.db.find_prefix_by_name(name) {
             let def = prefix_def.to_owned();
             return self.parse_sub(&def);
         }
 
-        // Prefix + remainder greedy match.
         if let Some((prefix_def, unit_name)) = self.db.find_with_prefix(name) {
             let prefix_str = prefix_def.to_owned();
             let unit_str = unit_name.to_owned();
@@ -455,13 +483,13 @@ impl<'db> Parser<'db> {
                 .units
                 .get(unit_str.as_str())
                 .cloned()
-                .ok_or_else(|| ParseError(format!("unknown unit: {unit_str}")))?;
+                .ok_or_else(|| ParseError::UnknownUnit(unit_str.clone()))?;
             let mut unit_val = self.resolve_entry(&unit_str, unit_entry)?;
             unit_val.multiply_assign(&prefix_val);
             return Ok(unit_val);
         }
 
-        Err(ParseError(format!("unknown unit or constant: {name}")))
+        Err(ParseError::UnknownUnit(name.to_owned()))
     }
 
     fn resolve_entry(&mut self, name: &str, entry: UnitEntry) -> Result<UnitValue, ParseError> {
@@ -470,12 +498,10 @@ impl<'db> Parser<'db> {
             UnitEntry::DimensionlessPrimitive => Ok(UnitValue::one()),
             UnitEntry::Derived(def) => {
                 if self.resolving.contains(name) {
-                    return Err(ParseError(format!("circular definition: {name}")));
+                    return Err(ParseError::CircularDefinition(name.to_owned()));
                 }
                 if self.depth >= MAX_DEPTH {
-                    return Err(ParseError(format!(
-                        "max recursion depth while resolving: {name}"
-                    )));
+                    return Err(ParseError::MaxRecursion(name.to_owned()));
                 }
                 self.resolving.insert(name.to_owned());
                 self.depth += 1;
@@ -487,15 +513,31 @@ impl<'db> Parser<'db> {
         }
     }
 
-    /// Parse a sub-expression string by temporarily swapping the token stream.
-    fn parse_sub(&mut self, expr: &str) -> Result<UnitValue, ParseError> {
-        let sub_tokens = tokenize(expr)?;
-        let saved_tokens = std::mem::replace(&mut self.tokens, sub_tokens);
-        let saved_pos = std::mem::replace(&mut self.pos, 0);
-        let result = self.parse_expr();
-        self.tokens = saved_tokens;
-        self.pos = saved_pos;
-        result
+    /// Extracts a dimensionless angle value (in radians) for ANGLEIN functions.
+    /// If `arg` is already dimensionless, returns its factor unchanged.
+    /// If dimensional, divides by `radian` and checks again; errors otherwise.
+    fn anglein(&mut self, func: &str, arg: UnitValue) -> Result<f64, ParseError> {
+        if arg.is_dimensionless() {
+            return Ok(arg.factor);
+        }
+        let radian = self
+            .parse_sub("radian")
+            .unwrap_or_else(|_| UnitValue::one());
+        let mut divided = arg;
+        divided.divide_assign(&radian);
+        if divided.is_dimensionless() {
+            return Ok(divided.factor);
+        }
+        Err(ParseError::DimensionlessRequired(func.to_owned()))
+    }
+
+    /// Wraps a radian value for ANGLEOUT functions (multiplies by the `radian` unit).
+    fn angleout(&mut self, radians: f64) -> UnitValue {
+        let mut radian = self
+            .parse_sub("radian")
+            .unwrap_or_else(|_| UnitValue::one());
+        radian.factor *= radians;
+        radian
     }
 
     fn call_function(&mut self, name: &str, arg: UnitValue) -> Result<UnitValue, ParseError> {
@@ -503,18 +545,14 @@ impl<'db> Parser<'db> {
             "sqrt" => {
                 let mut v = arg;
                 if !v.root_assign(2) {
-                    return Err(ParseError(
-                        "sqrt: dimension exponents not divisible by 2".to_owned(),
-                    ));
+                    return Err(ParseError::NotDivisibleByRoot);
                 }
                 Ok(v)
             }
-            "cbrt" => {
+            "cbrt" | "cuberoot" => {
                 let mut v = arg;
                 if !v.root_assign(3) {
-                    return Err(ParseError(
-                        "cbrt: dimension exponents not divisible by 3".to_owned(),
-                    ));
+                    return Err(ParseError::NotDivisibleByRoot);
                 }
                 Ok(v)
             }
@@ -524,82 +562,359 @@ impl<'db> Parser<'db> {
                 Ok(v)
             }
             "exp" => {
-                if !arg.is_dimensionless() {
-                    return Err(ParseError("exp: argument must be dimensionless".to_owned()));
-                }
+                require_dimensionless("exp", &arg)?;
                 Ok(UnitValue::from_factor(arg.factor.exp()))
             }
             "ln" => {
-                if !arg.is_dimensionless() {
-                    return Err(ParseError("ln: argument must be dimensionless".to_owned()));
-                }
+                require_dimensionless("ln", &arg)?;
                 Ok(UnitValue::from_factor(arg.factor.ln()))
             }
             "log" | "log10" => {
-                if !arg.is_dimensionless() {
-                    return Err(ParseError("log: argument must be dimensionless".to_owned()));
-                }
+                require_dimensionless("log", &arg)?;
                 Ok(UnitValue::from_factor(arg.factor.log10()))
             }
             "log2" => {
-                if !arg.is_dimensionless() {
-                    return Err(ParseError(
-                        "log2: argument must be dimensionless".to_owned(),
-                    ));
-                }
+                require_dimensionless("log2", &arg)?;
                 Ok(UnitValue::from_factor(arg.factor.log2()))
             }
-            "sin" => {
-                if !arg.is_dimensionless() {
-                    return Err(ParseError("sin: argument must be dimensionless".to_owned()));
+
+            "round" => {
+                require_dimensionless("round", &arg)?;
+                Ok(UnitValue::from_factor(arg.factor.round()))
+            }
+            "floor" => {
+                require_dimensionless("floor", &arg)?;
+                Ok(UnitValue::from_factor(arg.factor.floor()))
+            }
+            "ceil" => {
+                require_dimensionless("ceil", &arg)?;
+                Ok(UnitValue::from_factor(arg.factor.ceil()))
+            }
+            "secant" => {
+                let x = self.anglein("secant", arg)?;
+                let c = x.cos();
+                if c == 0.0 {
+                    return Err(ParseError::Undefined {
+                        func: "secant",
+                        reason: "cos is zero",
+                    });
                 }
-                Ok(UnitValue::from_factor(arg.factor.sin()))
+                Ok(UnitValue::from_factor(1.0 / c))
+            }
+            "sin" => {
+                let x = self.anglein("sin", arg)?;
+                Ok(UnitValue::from_factor(x.sin()))
             }
             "cos" => {
-                if !arg.is_dimensionless() {
-                    return Err(ParseError("cos: argument must be dimensionless".to_owned()));
-                }
-                Ok(UnitValue::from_factor(arg.factor.cos()))
+                let x = self.anglein("cos", arg)?;
+                Ok(UnitValue::from_factor(x.cos()))
             }
             "tan" => {
-                if !arg.is_dimensionless() {
-                    return Err(ParseError("tan: argument must be dimensionless".to_owned()));
-                }
-                Ok(UnitValue::from_factor(arg.factor.tan()))
+                let x = self.anglein("tan", arg)?;
+                Ok(UnitValue::from_factor(x.tan()))
             }
+            "csc" => {
+                let x = self.anglein("csc", arg)?;
+                let s = x.sin();
+                if s == 0.0 {
+                    return Err(ParseError::Undefined {
+                        func: "csc",
+                        reason: "sin is zero",
+                    });
+                }
+                Ok(UnitValue::from_factor(1.0 / s))
+            }
+            "cot" => {
+                let x = self.anglein("cot", arg)?;
+                let s = x.sin();
+                if s == 0.0 {
+                    return Err(ParseError::Undefined {
+                        func: "cot",
+                        reason: "sin is zero",
+                    });
+                }
+                Ok(UnitValue::from_factor(x.cos() / s))
+            }
+
+            // --- Inverse trigonometric ANGLEOUT (longer names first) ---
+            "asecant" => {
+                require_dimensionless("asecant", &arg)?;
+                if arg.factor.abs() < 1.0 {
+                    return Err(ParseError::OutOfRange {
+                        func: "asecant",
+                        constraint: "|argument| must be >= 1",
+                    });
+                }
+                Ok(self.angleout((1.0 / arg.factor).acos()))
+            }
+            "acos" => {
+                require_dimensionless("acos", &arg)?;
+                if arg.factor.abs() > 1.0 {
+                    return Err(ParseError::OutOfRange {
+                        func: "acos",
+                        constraint: "argument must be in [-1, 1]",
+                    });
+                }
+                Ok(self.angleout(arg.factor.acos()))
+            }
+            "asin" => {
+                require_dimensionless("asin", &arg)?;
+                if arg.factor.abs() > 1.0 {
+                    return Err(ParseError::OutOfRange {
+                        func: "asin",
+                        constraint: "argument must be in [-1, 1]",
+                    });
+                }
+                Ok(self.angleout(arg.factor.asin()))
+            }
+            "atan" => {
+                require_dimensionless("atan", &arg)?;
+                Ok(self.angleout(arg.factor.atan()))
+            }
+            "acsc" => {
+                require_dimensionless("acsc", &arg)?;
+                if arg.factor.abs() < 1.0 {
+                    return Err(ParseError::OutOfRange {
+                        func: "acsc",
+                        constraint: "|argument| must be >= 1",
+                    });
+                }
+                Ok(self.angleout((1.0 / arg.factor).asin()))
+            }
+            "acot" => {
+                require_dimensionless("acot", &arg)?;
+                Ok(self.angleout((1.0 / arg.factor).atan()))
+            }
+
+            // --- Hyperbolic inverse (longer names first) ---
+            "asinh" => {
+                require_dimensionless("asinh", &arg)?;
+                Ok(UnitValue::from_factor(arg.factor.asinh()))
+            }
+            "acosh" => {
+                require_dimensionless("acosh", &arg)?;
+                if arg.factor < 1.0 {
+                    return Err(ParseError::OutOfRange {
+                        func: "acosh",
+                        constraint: "argument must be >= 1",
+                    });
+                }
+                Ok(UnitValue::from_factor(arg.factor.acosh()))
+            }
+            "atanh" => {
+                require_dimensionless("atanh", &arg)?;
+                if arg.factor.abs() >= 1.0 {
+                    return Err(ParseError::OutOfRange {
+                        func: "atanh",
+                        constraint: "argument must be in (-1, 1)",
+                    });
+                }
+                Ok(UnitValue::from_factor(arg.factor.atanh()))
+            }
+            "acsch" => {
+                require_dimensionless("acsch", &arg)?;
+                if arg.factor == 0.0 {
+                    return Err(ParseError::OutOfRange {
+                        func: "acsch",
+                        constraint: "argument cannot be zero",
+                    });
+                }
+                Ok(UnitValue::from_factor((1.0 / arg.factor).asinh()))
+            }
+            "asech" => {
+                require_dimensionless("asech", &arg)?;
+                if arg.factor <= 0.0 || arg.factor > 1.0 {
+                    return Err(ParseError::OutOfRange {
+                        func: "asech",
+                        constraint: "argument must be in (0, 1]",
+                    });
+                }
+                Ok(UnitValue::from_factor((1.0 / arg.factor).acosh()))
+            }
+            "acoth" => {
+                require_dimensionless("acoth", &arg)?;
+                if arg.factor.abs() <= 1.0 {
+                    return Err(ParseError::OutOfRange {
+                        func: "acoth",
+                        constraint: "|argument| must be > 1",
+                    });
+                }
+                Ok(UnitValue::from_factor((1.0 / arg.factor).atanh()))
+            }
+
+            // --- Hyperbolic (longer names first) ---
+            "sinh" => {
+                require_dimensionless("sinh", &arg)?;
+                Ok(UnitValue::from_factor(arg.factor.sinh()))
+            }
+            "cosh" => {
+                require_dimensionless("cosh", &arg)?;
+                Ok(UnitValue::from_factor(arg.factor.cosh()))
+            }
+            "tanh" => {
+                require_dimensionless("tanh", &arg)?;
+                Ok(UnitValue::from_factor(arg.factor.tanh()))
+            }
+            "csch" => {
+                require_dimensionless("csch", &arg)?;
+                let s = arg.factor.sinh();
+                if s == 0.0 {
+                    return Err(ParseError::Undefined {
+                        func: "csch",
+                        reason: "sinh is zero",
+                    });
+                }
+                Ok(UnitValue::from_factor(1.0 / s))
+            }
+            "sech" => {
+                require_dimensionless("sech", &arg)?;
+                Ok(UnitValue::from_factor(1.0 / arg.factor.cosh()))
+            }
+            "coth" => {
+                require_dimensionless("coth", &arg)?;
+                let s = arg.factor.sinh();
+                if s == 0.0 {
+                    return Err(ParseError::Undefined {
+                        func: "coth",
+                        reason: "sinh is zero",
+                    });
+                }
+                Ok(UnitValue::from_factor(arg.factor.cosh() / s))
+            }
+
+            // --- Special functions (DIMENSIONLESS) ---
+            "erf" => {
+                require_dimensionless("erf", &arg)?;
+                Ok(UnitValue::from_factor(erf_approx(arg.factor)))
+            }
+            "erfc" => {
+                require_dimensionless("erfc", &arg)?;
+                Ok(UnitValue::from_factor(1.0 - erf_approx(arg.factor)))
+            }
+            "lnGamma" => {
+                require_dimensionless("lnGamma", &arg)?;
+                Ok(UnitValue::from_factor(gamma_lanczos(arg.factor).abs().ln()))
+            }
+            "Gamma" => {
+                require_dimensionless("Gamma", &arg)?;
+                let val = gamma_lanczos(arg.factor);
+                if !val.is_finite() {
+                    return Err(ParseError::Undefined {
+                        func: "Gamma",
+                        reason: "non-positive integer argument",
+                    });
+                }
+                Ok(UnitValue::from_factor(val))
+            }
+            "factorial" => {
+                require_dimensionless("factorial", &arg)?;
+                if arg.factor < 0.0 {
+                    return Err(ParseError::OutOfRange {
+                        func: "factorial",
+                        constraint: "argument must be >= 0",
+                    });
+                }
+                if arg.factor.fract() != 0.0 {
+                    return Err(ParseError::OutOfRange {
+                        func: "factorial",
+                        constraint: "argument must be a non-negative integer",
+                    });
+                }
+                Ok(UnitValue::from_factor(gamma_lanczos(arg.factor + 1.0)))
+            }
+
             _ => {
-                // Check if it's a table call: tablename(numeric_value)
+                // logN: log base N for any all-digit suffix not already matched (e.g. log3, log16)
+                if let Some(base_str) = name.strip_prefix("log")
+                    && !base_str.is_empty()
+                    && base_str.chars().all(|c| c.is_ascii_digit())
+                {
+                    let Ok(base) = base_str.parse::<f64>() else {
+                        return Err(ParseError::Grammar(format!("{name}: invalid log base")));
+                    };
+                    if base > 1.0 {
+                        require_dimensionless(name, &arg)?;
+                        return Ok(UnitValue::from_factor(arg.factor.ln() / base.ln()));
+                    }
+                }
                 if let Some(table) = self.db.tables.get(name) {
                     if !arg.is_dimensionless() {
-                        return Err(ParseError(format!(
-                            "table {name}: argument must be dimensionless"
-                        )));
+                        return Err(ParseError::DimensionlessRequired(name.to_owned()));
                     }
-                    let output = table
-                        .interpolate(arg.factor)
-                        .ok_or_else(|| ParseError(format!("table {name}: interpolation failed")))?;
+                    let output =
+                        table
+                            .interpolate(arg.factor)
+                            .ok_or_else(|| ParseError::NotInDomain {
+                                func: name.to_owned(),
+                                arg: 1,
+                            })?;
                     let unit_expr = format!("{output} {}", table.unit);
                     return self.parse_sub(&unit_expr);
                 }
-                self.call_user_function(name, arg)
+                Err(ParseError::UnknownUnit(name.to_owned()))
             }
         }
     }
 
-    fn call_user_function(&mut self, name: &str, arg: UnitValue) -> Result<UnitValue, ParseError> {
-        let func: FunctionDef = self
-            .db
-            .functions
-            .get(name)
-            .cloned()
-            .ok_or_else(|| ParseError(format!("unknown function: {name}")))?;
+    /// Dispatch function call with an argument list of any size.
+    ///
+    /// - User-defined functions (`db.functions`): support zero or multiple args.
+    /// - Built-in functions and tables: require exactly 1 argument.
+    fn call_function_multi(
+        &mut self,
+        name: &str,
+        args: Vec<UnitValue>,
+    ) -> Result<UnitValue, ParseError> {
+        if let Some(func) = self.db.functions.get(name).cloned() {
+            return self.call_user_function(name, func, args);
+        }
+        if args.len() != 1 {
+            return Err(ParseError::ArityMismatch {
+                func: name.to_owned(),
+                expected: 1,
+                got: args.len(),
+            });
+        }
+        let arg = args.into_iter().next().expect("args.len() == 1");
+        self.call_function(name, arg)
+    }
 
-        let old_val = self.vars.insert(func.param.clone(), arg);
-        let result = self.parse_sub(&func.forward.clone());
-        if let Some(v) = old_val {
-            self.vars.insert(func.param.clone(), v);
-        } else {
-            self.vars.remove(&func.param);
+    fn call_user_function(
+        &mut self,
+        name: &str,
+        func: FunctionDef,
+        args: Vec<UnitValue>,
+    ) -> Result<UnitValue, ParseError> {
+        if args.len() != func.params.len() {
+            return Err(ParseError::ArityMismatch {
+                func: name.to_owned(),
+                expected: func.params.len(),
+                got: args.len(),
+            });
+        }
+        // Zero-arg: body is a unit alias — parse directly without binding variables.
+        if func.params.is_empty() {
+            return self.parse_sub(&func.forward);
+        }
+        if !func.noerror {
+            for (i, arg) in args.iter().enumerate() {
+                let unit_str = func.units.get(i).and_then(|u| u.as_deref());
+                let domain = func.domain.get(i).and_then(|d| d.as_ref());
+                self.validate_func_arg(name, i, arg, unit_str, domain)?;
+            }
+        }
+        let mut old_vals: Vec<(String, Option<UnitValue>)> = Vec::new();
+        for (param, arg) in func.params.iter().zip(args) {
+            let old = self.vars.insert(param.clone(), arg);
+            old_vals.push((param.clone(), old));
+        }
+        let result = self.parse_sub(&func.forward);
+        for (param, old) in old_vals {
+            if let Some(v) = old {
+                self.vars.insert(param, v);
+            } else {
+                self.vars.remove(&param);
+            }
         }
         result
     }
@@ -614,10 +929,24 @@ impl<'db> Parser<'db> {
             .functions
             .get(name)
             .cloned()
-            .ok_or_else(|| ParseError(format!("unknown function for inverse: {name}")))?;
+            .ok_or_else(|| ParseError::UnknownUnit(name.to_owned()))?;
+        if func.params.len() != 1 {
+            return Err(ParseError::InverseNotSupported {
+                func: name.to_owned(),
+            });
+        }
         let reverse = func
             .reverse
-            .ok_or_else(|| ParseError(format!("function has no inverse: {name}")))?;
+            .ok_or_else(|| ParseError::NoInverse(name.to_owned()))?;
+        if !func.noerror {
+            self.validate_func_arg(
+                name,
+                0,
+                &arg,
+                func.inverse_unit.as_deref(),
+                func.range.as_ref(),
+            )?;
+        }
         let old_val = self.vars.insert(name.to_owned(), arg);
         let result = self.parse_sub(&reverse);
         if let Some(v) = old_val {
@@ -627,49 +956,68 @@ impl<'db> Parser<'db> {
         }
         result
     }
+
+    /// Check that `arg` is dimensionally conformable with `unit_str` (if given)
+    /// and that the resulting scalar lies within `domain` (if given).
+    ///
+    /// `idx` is 0-based and used only for error messages.
+    fn validate_func_arg(
+        &mut self,
+        func_name: &str,
+        idx: usize,
+        arg: &UnitValue,
+        unit_str: Option<&str>,
+        domain: Option<&super::database::Interval>,
+    ) -> Result<(), ParseError> {
+        let value = if let Some(unit_str) = unit_str {
+            let unit_val = self.parse_sub(unit_str)?;
+            if !are_conformable(arg, &unit_val) {
+                return Err(ParseError::WrongDimensions {
+                    func: func_name.to_owned(),
+                    arg: idx + 1,
+                });
+            }
+            arg.factor / unit_val.factor
+        } else {
+            arg.factor
+        };
+        let Some(interval) = domain else {
+            return Ok(());
+        };
+        if !interval.contains(value) {
+            return Err(ParseError::NotInDomain {
+                func: func_name.to_owned(),
+                arg: idx + 1,
+            });
+        }
+        Ok(())
+    }
 }
 
-/// Parse a GNU units expression string into a fully-reduced [`UnitValue`].
-///
-/// All derived units are recursively expanded; only primitive base units
-/// (defined with `!`) remain in `dimensions`.
 pub(crate) fn parseunit(input: &str) -> Result<UnitValue, ParseError> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
-        return Err(ParseError("empty expression".to_owned()));
+        return Err(ParseError::EmptyExpression);
     }
-    let tokens = tokenize(trimmed)?;
+    let expr_pair = parse_to_expr_pair(trimmed)?;
     let db = db_read();
-    let mut parser = Parser::new(tokens, &db);
-    let result = parser.parse_expr()?;
-    // Ensure the entire input was consumed.
-    if !matches!(parser.peek(), Token::Eof) {
-        return Err(ParseError(format!(
-            "unexpected trailing input: {:?}",
-            parser.peek()
-        )));
-    }
-    Ok(result)
+    let mut eval = Evaluator::new(&db);
+    eval.eval_expr(expr_pair)
 }
 
-/// Parse a sub-expression with pre-existing variable bindings (used for
-/// function evaluation at the call site in `mod.rs`).
 pub(crate) fn parseunit_with_vars(
     input: &str,
     vars: &HashMap<String, UnitValue>,
 ) -> Result<UnitValue, ParseError> {
-    let tokens = tokenize(input.trim())?;
-    let db = db_read();
-    let mut parser = Parser::new(tokens, &db);
-    parser.vars = vars.clone();
-    let result = parser.parse_expr()?;
-    if !matches!(parser.peek(), Token::Eof) {
-        return Err(ParseError(format!(
-            "unexpected trailing input: {:?}",
-            parser.peek()
-        )));
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(ParseError::EmptyExpression);
     }
-    Ok(result)
+    let expr_pair = parse_to_expr_pair(trimmed)?;
+    let db = db_read();
+    let mut eval = Evaluator::new(&db);
+    eval.vars = vars.clone();
+    eval.eval_expr(expr_pair)
 }
 
 #[cfg(test)]
@@ -680,33 +1028,6 @@ mod tests {
 
     use super::*;
     use crate::engine::native::types::UnitValue;
-
-    #[test]
-    fn tokenize_number() {
-        let tokens = tokenize("42").unwrap();
-
-        assert_eq!(tokens[0], Token::Num(42.0));
-        assert_eq!(tokens[1], Token::Eof);
-    }
-
-    #[test]
-    fn tokenize_hex() {
-        let tokens = tokenize("0xff").unwrap();
-
-        assert_eq!(tokens[0], Token::Num(255.0));
-        assert_eq!(tokens[1], Token::Eof);
-    }
-
-    #[test]
-    fn tokenize_operators() {
-        let tokens = tokenize("* / ^ |").unwrap();
-
-        assert_eq!(tokens[0], Token::Star);
-        assert_eq!(tokens[1], Token::Slash);
-        assert_eq!(tokens[2], Token::Caret);
-        assert_eq!(tokens[3], Token::Pipe);
-        assert_eq!(tokens[4], Token::Eof);
-    }
 
     #[test]
     fn parse_simple_number() {
@@ -806,8 +1127,6 @@ mod tests {
         assert_eq!(v.dimensions.get("kg"), Some(&1));
     }
 
-    /// Uses the standard `square(x)` function from definitions.units (x^2)
-    /// to exercise the user-function code path without mutating the global DB.
     #[test]
     fn call_user_function() {
         crate::definitions::ensure_definitions();
@@ -826,7 +1145,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// Uses numeric-only sub-expressions so no unit-DB lookup is needed.
     #[rstest]
     #[case::missing_close("(2")]
     #[case::stray_close(")")]
@@ -841,7 +1159,7 @@ mod tests {
         let result = parseunit("2 )");
 
         assert!(result.is_err());
-        let msg = result.unwrap_err().0;
+        let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("trailing"),
             "expected trailing-input error, got: {msg}"
@@ -866,8 +1184,129 @@ mod tests {
 
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().0.contains("trailing"),
+            result.unwrap_err().to_string().contains("trailing"),
             "error should mention trailing input"
+        );
+    }
+
+    // --- Signed-integer exponents (regression guard for pest migration) ---
+
+    #[rstest]
+    #[case::negative("m^-1", "m", -1)]
+    #[case::double_star_negative("m**-2", "m", -2)]
+    fn power_signed_exponent(#[case] input: &str, #[case] dim: &str, #[case] exp: i32) {
+        crate::definitions::ensure_definitions();
+
+        let v = parseunit(input).unwrap();
+
+        assert_eq!(v.dimensions.get(dim), Some(&exp));
+    }
+
+    #[test]
+    fn parse_power_negative_dimensionless() {
+        let v = parseunit("2^-1").unwrap();
+
+        assert!((v.factor - 0.5).abs() < 1e-12);
+        assert!(v.is_dimensionless());
+    }
+
+    // --- Hex literals (regression guard for pest migration) ---
+
+    #[rstest]
+    #[case::lowercase("0xff", 255.0)]
+    #[case::uppercase_digits("0xFF", 255.0)]
+    #[case::zero("0x0", 0.0)]
+    fn parse_hex_number(#[case] input: &str, #[case] expected: f64) {
+        let v = parseunit(input).unwrap();
+
+        assert_eq!(v.factor, expected);
+        assert!(v.is_dimensionless());
+    }
+
+    #[test]
+    fn parse_malformed_hex_matches_c_strtod() {
+        // `0xGG`: hex_number fails (G is not hex), decimal_number matches "0",
+        // "GG" is juxtaposed but swallowed because factor is 0 — mirrors C strtod.
+        let v = parseunit("0xGG").unwrap();
+
+        assert_eq!(v.factor, 0.0);
+        assert!(v.is_dimensionless());
+    }
+
+    #[test]
+    fn parse_malformed_hex_does_not_acquire_dimensions() {
+        crate::definitions::ensure_definitions();
+
+        let v = parseunit("0xkg").unwrap();
+
+        assert_eq!(v.factor, 0.0);
+        assert!(
+            v.is_dimensionless(),
+            "0xkg must be dimensionless (C compat), got: {:?}",
+            v.dimensions
+        );
+    }
+
+    #[test]
+    fn parse_malformed_hex_0xm_is_dimensionless_zero() {
+        crate::definitions::ensure_definitions();
+
+        let v = parseunit("0xm").unwrap();
+
+        assert_eq!(v.factor, 0.0);
+        assert!(v.is_dimensionless());
+    }
+
+    #[test]
+    fn zero_factor_does_not_swallow_parse_error() {
+        let result = parseunit("0 )");
+
+        assert!(result.is_err());
+    }
+
+    // --- Unary plus ---
+
+    #[test]
+    fn error_on_unary_plus_in_exponent() {
+        crate::definitions::ensure_definitions();
+
+        let result = parseunit("m^+2");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn error_on_unary_plus() {
+        let result = parseunit("+5");
+
+        assert!(result.is_err());
+    }
+
+    // --- Error messages ---
+
+    #[test]
+    fn error_on_unknown_unit_message() {
+        let result = parseunit("ZZZNOTAUNIT");
+
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("unknown"),
+            "expected 'unknown' in error message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn error_on_incompatible_dimensions_addition() {
+        crate::definitions::ensure_definitions();
+
+        let result = parseunit("m + kg");
+
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("incompatible"),
+            "expected incompatible-dimensions error, got: {msg}"
         );
     }
 }

@@ -7,7 +7,7 @@ use std::os::raw::c_int;
 use std::ptr;
 use std::sync::Mutex;
 
-use crate::error_codes as E;
+use crate::ErrorCode;
 use crate::{Result, UnitsError};
 
 static GNU_UNITS_MUTEX: Mutex<()> = Mutex::new(());
@@ -20,10 +20,10 @@ pub(crate) fn lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 fn from_code(code: c_int) -> Option<UnitsError> {
-    if code == E::E_NORMAL {
+    if code == ErrorCode::Normal as i32 {
         return None;
     }
-    Some(UnitsError { code })
+    Some(UnitsError(ErrorCode::from_raw(code)))
 }
 
 pub(crate) fn unit_new() -> RawUnit {
@@ -39,7 +39,7 @@ pub(crate) fn unit_new() -> RawUnit {
 pub(crate) fn unit_parse(input: &str) -> Result<RawUnit> {
     let _guard = lock();
     let mut raw = unit_new();
-    let c_input = CString::new(input).map_err(|_| UnitsError { code: E::E_PARSE })?;
+    let c_input = CString::new(input).map_err(|_| UnitsError(ErrorCode::Parse))?;
     // SAFETY: raw is freshly initialized; c_input is a valid NUL-terminated string.
     // GNU_UNITS_MUTEX is held.
     let code = unsafe {
@@ -140,7 +140,7 @@ pub(crate) fn unit_invert(unit: &mut RawUnit) {
 
 pub(crate) fn unit_pow(unit: &mut RawUnit, power: i32) -> Result<()> {
     if power < 0 {
-        return Err(UnitsError { code: E::E_BADNUM });
+        return Err(UnitsError(ErrorCode::BadNum));
     }
     let _guard = lock();
     // SAFETY: unit is valid. expunit modifies factor and dimensions. GNU_UNITS_MUTEX is held.
@@ -150,7 +150,7 @@ pub(crate) fn unit_pow(unit: &mut RawUnit, power: i32) -> Result<()> {
 
 pub(crate) fn unit_root(unit: &mut RawUnit, n: i32) -> Result<()> {
     if n <= 0 {
-        return Err(UnitsError { code: E::E_NOTROOT });
+        return Err(UnitsError(ErrorCode::NotRoot));
     }
     let _guard = lock();
     // SAFETY: unit is valid. rootunit modifies factor and dimensions. GNU_UNITS_MUTEX is held.
@@ -201,15 +201,15 @@ pub(crate) fn unit_drop(unit: &mut RawUnit) {
     }
 }
 
-pub(crate) fn convert_func(from: &str, to: &str) -> Option<f64> {
+pub(crate) fn convert_func(from: &str, to: &str) -> crate::Result<f64> {
     let _guard = lock();
 
-    let c_name = CString::new(to).ok()?;
-    let c_from = CString::new(from).ok()?;
+    let c_name = CString::new(to).map_err(|_| UnitsError(ErrorCode::NotAFunc))?;
+    let c_from = CString::new(from).map_err(|_| UnitsError(ErrorCode::NotAFunc))?;
     // SAFETY: c_name is a valid NUL-terminated CString. GNU_UNITS_MUTEX is held.
     let func_ptr = unsafe { gnu_units_sys::fnlookup(c_name.as_ptr()) };
     if func_ptr.is_null() {
-        return None;
+        return Err(UnitsError(ErrorCode::NotAFunc));
     }
 
     let mut unit = unit_new();
@@ -217,18 +217,18 @@ pub(crate) fn convert_func(from: &str, to: &str) -> Option<f64> {
     let code = unsafe {
         gnu_units_sys::parseunit(&mut unit, c_from.as_ptr(), ptr::null_mut(), ptr::null_mut())
     };
-    if from_code(code).is_some() {
+    if let Some(err) = from_code(code) {
         unit_drop(&mut unit);
-        return None;
+        return Err(err);
     }
 
     let mut unit_ptr = &mut unit as *mut RawUnit;
     // SAFETY: unit_ptr points to a valid parsed unit, func_ptr is verified non-null.
     // evalfunc modifies unit in place through the pointer. GNU_UNITS_MUTEX is held.
     let code = unsafe { gnu_units_sys::evalfunc(1, &mut unit_ptr, func_ptr, 1, 0) };
-    if from_code(code).is_some() {
+    if let Some(err) = from_code(code) {
         unit_drop(&mut unit);
-        return None;
+        return Err(err);
     }
 
     debug_assert!(std::ptr::eq(unit_ptr, &mut unit as *mut _));
@@ -236,14 +236,14 @@ pub(crate) fn convert_func(from: &str, to: &str) -> Option<f64> {
     // SAFETY: unit_ptr still points to unit (evalfunc does not reassign the pointer).
     // completereduce reduces to base units. GNU_UNITS_MUTEX is held.
     let code = unsafe { gnu_units_sys::completereduce(unit_ptr) };
-    if from_code(code).is_some() {
+    if let Some(err) = from_code(code) {
         unit_drop(&mut unit);
-        return None;
+        return Err(err);
     }
 
     let factor = unit.factor;
     unit_drop(&mut unit);
-    Some(factor)
+    Ok(factor)
 }
 
 /// Registers a new unit prefix. Acquires `GNU_UNITS_MUTEX` internally.

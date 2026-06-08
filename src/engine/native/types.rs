@@ -83,7 +83,7 @@ impl UnitValue {
     pub fn invert(&mut self) {
         self.factor = 1.0 / self.factor;
         for exp in self.dimensions.values_mut() {
-            *exp = -*exp;
+            *exp = exp.wrapping_neg();
         }
     }
 
@@ -135,7 +135,7 @@ impl UnitValue {
                     }
                 }
                 std::cmp::Ordering::Less => {
-                    for _ in 0..(-exp) {
+                    for _ in 0..exp.unsigned_abs() {
                         denominators.push(unit.as_str());
                     }
                 }
@@ -161,6 +161,48 @@ impl UnitValue {
 impl Default for UnitValue {
     fn default() -> Self {
         Self::one()
+    }
+}
+
+/// Converts a floating-point value to a rational approximation `p/q` using a
+/// continued-fraction expansion (up to 20 terms), replicating `float2rat` from
+/// the GNU units C source.
+///
+/// Returns `Some((p, q))` when `q < 100` and the approximation error is within
+/// [`f64::EPSILON`].  Returns `None` when the value cannot be approximated by a
+/// small-denominator rational (irrational or too large).
+pub(crate) fn float2rat(y: f64) -> Option<(i32, i32)> {
+    let mut coef = [0i32; 20];
+    let mut x = y;
+    let mut termcount = 0usize;
+
+    loop {
+        let floor_val = x.floor();
+        if !floor_val.is_finite() || floor_val > i32::MAX as f64 || floor_val < i32::MIN as f64 {
+            return None;
+        }
+        coef[termcount] = floor_val as i32;
+        let fracpart = x - floor_val;
+        if fracpart < 0.001 || termcount == 19 {
+            break;
+        }
+        x = 1.0 / fracpart;
+        termcount += 1;
+    }
+
+    let mut p: i32 = 0;
+    let mut q: i32 = 1;
+    for i in (1..=termcount).rev() {
+        let saveq = q;
+        q = coef[i].saturating_mul(q).saturating_add(p);
+        p = saveq;
+    }
+    p = p.saturating_add(q.saturating_mul(coef[0]));
+
+    if q < 100 && (p as f64 / q as f64 - y).abs() < f64::EPSILON {
+        Some((p, q))
+    } else {
+        None
     }
 }
 

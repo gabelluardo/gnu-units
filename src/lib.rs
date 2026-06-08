@@ -28,39 +28,79 @@ pub use self::currency_update::{
 };
 
 /// Numeric error codes matching the GNU units C library values.
-#[allow(dead_code)]
-pub(crate) mod error_codes {
-    pub const E_NORMAL: i32 = 0;
-    pub const E_PARSE: i32 = 1;
-    pub const E_BADSUM: i32 = 5;
-    pub const E_NOTANUMBER: i32 = 6;
-    pub const E_NOTROOT: i32 = 7;
-    pub const E_UNKNOWNUNIT: i32 = 8;
-    pub const E_BADNUM: i32 = 20;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum ErrorCode {
+    /// Successful conversion (no error).
+    Normal = 0,
+    /// Expression could not be parsed.
+    Parse = 1,
+    /// Incompatible dimensions in addition or subtraction.
+    BadSum = 5,
+    /// Result is not a dimensionless number.
+    NotANumber = 6,
+    /// Root of a non-integer dimension.
+    NotRoot = 7,
+    /// Unit name not found in the database.
+    UnknownUnit = 8,
+    /// Function argument outside its valid domain.
+    NotInDomain = 10,
+    /// Function argument has wrong dimensions.
+    BadFuncArg = 11,
+    /// Dimensional unit raised to an irrational exponent.
+    IrrationalExponent = 12,
+    /// Expression is not a function or table (used for fallback logic).
+    NotAFunc = 13,
+    /// Invalid numeric literal.
+    BadNum = 20,
+}
+
+impl ErrorCode {
+    #[cfg(feature = "vendored")]
+    pub(crate) fn from_raw(code: i32) -> Self {
+        match code {
+            0 => Self::Normal,
+            1 => Self::Parse,
+            5 => Self::BadSum,
+            6 => Self::NotANumber,
+            7 => Self::NotRoot,
+            8 => Self::UnknownUnit,
+            10 => Self::NotInDomain,
+            11 => Self::BadFuncArg,
+            12 => Self::IrrationalExponent,
+            13 => Self::NotAFunc,
+            20 => Self::BadNum,
+            _ => Self::Parse,
+        }
+    }
 }
 
 /// Wraps a raw error code returned by the units engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UnitsError {
-    /// Raw error code as defined in [`error_codes`].
-    pub code: i32,
-}
+pub struct UnitsError(ErrorCode);
 
 impl UnitsError {
+    /// Returns the error code as defined in [`ErrorCode`].
+    pub fn code(&self) -> ErrorCode {
+        self.0
+    }
+
     /// Returns `true` when the error indicates a dimensionless reduction failed.
+    #[cfg(test)]
     pub fn is_not_dimensionless(&self) -> bool {
-        self.code == error_codes::E_NOTANUMBER
+        self.0 == ErrorCode::NotANumber
     }
 
     /// Returns `true` when the expression was invalid (unknown/unparseable).
+    #[cfg(test)]
     pub fn is_invalid_unit(&self) -> bool {
-        self.code == error_codes::E_UNKNOWNUNIT || self.code == error_codes::E_PARSE
+        self.0 == ErrorCode::UnknownUnit || self.0 == ErrorCode::Parse
     }
 }
 
 impl fmt::Display for UnitsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "GNU units error code {}", self.code)
+        write!(f, "GNU units error code {}", self.0 as i32)
     }
 }
 
@@ -181,10 +221,14 @@ pub fn parse(input: &str) -> Result<Unit> {
 
 /// Parses `from` and `to` as GNU units expressions and returns the numeric
 /// conversion factor.
+///
+/// First attempts a function or table conversion; if neither applies
+/// ([`ErrorCode::NotAFunc`]), falls back to standard unit division.
 pub fn convert(from: &str, to: &str) -> Result<f64> {
     ensure_definitions();
-    if let Some(factor) = engine::convert_func(from, to) {
-        return Ok(factor);
+    match engine::convert_func(from, to) {
+        Err(e) if e.code() == ErrorCode::NotAFunc => {}
+        result => return result,
     }
     Unit::parse(from)?.convert_to(Unit::parse(to)?)
 }
@@ -229,35 +273,44 @@ pub fn reload_currency(content: &str) {
     defs.sort_by(|a, b| a.name.cmp(&b.name));
 }
 
+// Required so that `Result<Unit, UnitsError>::unwrap_err()` compiles in tests
+// (unwrap_err needs T: Debug to format the unexpected Ok value).
+#[cfg(test)]
+impl fmt::Debug for Unit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Unit {{ factor: {} }}", self.factor())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::definitions::replace_operators;
+    use crate::definitions::{ensure_definitions, replace_operators};
 
     #[test]
     fn units_error_display() {
-        let err = UnitsError { code: 42 };
+        let err = UnitsError(ErrorCode::BadNum);
 
         let s = format!("{err}");
 
-        assert!(s.contains("42"));
+        assert!(s.contains("20"));
     }
 
     #[rstest]
-    #[case::eq_same_code(1, 1, true)]
-    #[case::ne_different_code(1, 2, false)]
-    fn units_error_eq_semantics(#[case] a: i32, #[case] b: i32, #[case] equal: bool) {
-        let ea = UnitsError { code: a };
-        let eb = UnitsError { code: b };
+    #[case::eq_same_code(ErrorCode::Parse, ErrorCode::Parse, true)]
+    #[case::ne_different_code(ErrorCode::Parse, ErrorCode::BadSum, false)]
+    fn units_error_eq_semantics(#[case] a: ErrorCode, #[case] b: ErrorCode, #[case] equal: bool) {
+        let ea = UnitsError(a);
+        let eb = UnitsError(b);
 
         assert_eq!(ea == eb, equal);
     }
 
     #[test]
     fn units_error_copy_semantics() {
-        let original = UnitsError { code: 5 };
+        let original = UnitsError(ErrorCode::BadSum);
 
         let copy = original;
 
@@ -265,21 +318,21 @@ mod tests {
     }
 
     #[rstest]
-    #[case::notanumber(error_codes::E_NOTANUMBER, true)]
-    #[case::e_parse(error_codes::E_PARSE, false)]
-    #[case::e_badsum(error_codes::E_BADSUM, false)]
-    fn is_not_dimensionless(#[case] code: i32, #[case] expected: bool) {
-        let err = UnitsError { code };
+    #[case::notanumber(ErrorCode::NotANumber, true)]
+    #[case::e_parse(ErrorCode::Parse, false)]
+    #[case::e_badsum(ErrorCode::BadSum, false)]
+    fn is_not_dimensionless(#[case] code: ErrorCode, #[case] expected: bool) {
+        let err = UnitsError(code);
 
         assert_eq!(err.is_not_dimensionless(), expected);
     }
 
     #[rstest]
-    #[case::e_parse(error_codes::E_PARSE, true)]
-    #[case::e_unknownunit(error_codes::E_UNKNOWNUNIT, true)]
-    #[case::e_notanumber(error_codes::E_NOTANUMBER, false)]
-    fn is_invalid_unit(#[case] code: i32, #[case] expected: bool) {
-        let err = UnitsError { code };
+    #[case::e_parse(ErrorCode::Parse, true)]
+    #[case::e_unknownunit(ErrorCode::UnknownUnit, true)]
+    #[case::e_notanumber(ErrorCode::NotANumber, false)]
+    fn is_invalid_unit(#[case] code: ErrorCode, #[case] expected: bool) {
+        let err = UnitsError(code);
 
         assert_eq!(err.is_invalid_unit(), expected);
     }
@@ -291,10 +344,19 @@ mod tests {
         assert_eq!(unit.factor(), 1.0);
     }
 
+    #[test]
+    fn error_on_unary_plus() {
+        let result = Unit::parse("+5");
+
+        assert!(result.is_err());
+    }
+
     #[rstest]
     #[case::integer("5", 5.0)]
     #[case::float("3.15", 3.15)]
     #[case::scientific("1e10", 1e10)]
+    #[case::hex_literal("0xff", 255.0)]
+    #[case::negative_exponent_dimensionless("2^-1", 0.5)]
     fn parse_numeric(#[case] input: &str, #[case] expected: f64) {
         let result = Unit::parse(input);
 
@@ -309,6 +371,38 @@ mod tests {
         let result = Unit::parse(input);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_hex_without_valid_digits_is_zero() {
+        let result = Unit::parse("0xGG");
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().factor(), 0.0);
+    }
+
+    /// Malformed numeric literals and trailing input must produce `E_PARSE`,
+    /// not `E_UNKNOWNUNIT` — ensures the parser gate is hit before unit lookup.
+    #[rstest]
+    #[case::error_on_trailing_paren("2 )")]
+    fn parse_error_code_is_e_parse(#[case] input: &str) {
+        let result = Unit::parse(input);
+
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::Parse);
+    }
+
+    #[test]
+    fn parse_m_inverse_has_inverse_dimension() {
+        let unit = Unit::parse("m^-1").unwrap();
+
+        let base = unit.base_units();
+
+        assert_eq!(unit.factor(), 1.0);
+        assert!(
+            base.contains("/ m"),
+            "expected '/ m' in base_units, got: {base}"
+        );
     }
 
     #[test]
@@ -780,18 +874,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pipe_operator_reciprocal() {
-        let unit = Unit::parse("1|2").unwrap();
+    #[rstest]
+    #[case::reciprocal("1|2", 0.5)]
+    #[case::fraction_5_9("5|9", 5.0 / 9.0)]
+    #[case::numdiv_3_8("3|8", 0.375)]
+    fn pipe_factor(#[case] input: &str, #[case] expected: f64) {
+        let unit = Unit::parse(input).unwrap();
 
-        assert!((unit.factor() - 0.5).abs() < 1e-12);
-    }
-
-    #[test]
-    fn pipe_operator_fraction() {
-        let unit = Unit::parse("5|9").unwrap();
-
-        assert!((unit.factor() - (5.0 / 9.0)).abs() < 1e-12);
+        assert!(
+            (unit.factor() - expected).abs() < 1e-12,
+            "{input} factor = {}, expected {expected}",
+            unit.factor()
+        );
     }
 
     #[test]
@@ -803,5 +897,76 @@ mod tests {
         let second = list_definitions();
 
         assert_eq!(second.len(), original_len);
+    }
+
+    /// `m^(1|3)` must fail: the native engine uses integer dimension exponents,
+    /// so root-3 of `m^1` is not representable (1 % 3 != 0).
+    /// GAP: to support fractional-power dimensional units, the engine would need
+    /// rational exponents in `UnitValue::dimensions`.
+    #[test]
+    fn rational_exponent_one_third() {
+        ensure_definitions();
+
+        let result = Unit::parse("m^(1|3)");
+
+        assert!(
+            result.is_err(),
+            "m^(1|3) should fail (integer-only dimension exponents)"
+        );
+    }
+
+    #[rstest]
+    #[case::fractional_exponent("8^(1|3)", 2.0)]
+    #[case::asin("asin(1)", std::f64::consts::FRAC_PI_2)]
+    #[case::cuberoot("cuberoot(27)", 3.0)]
+    #[case::round("round(3.7)", 4.0)]
+    fn builtin_factor(#[case] input: &str, #[case] expected: f64) {
+        ensure_definitions();
+
+        let v = Unit::parse(input).unwrap();
+
+        assert!(
+            (v.factor() - expected).abs() < 1e-9,
+            "{input} factor = {}, expected {expected}",
+            v.factor()
+        );
+    }
+
+    /// `3|8 m`: the `|` consumes only its two adjacent `power` operands (both
+    /// dimensionless), then `m` is juxtaposed onto the 0.375 result.
+    #[test]
+    fn pipe_numdiv_with_unit() {
+        ensure_definitions();
+
+        let v = Unit::parse("3|8 m").unwrap();
+
+        assert!(
+            (v.factor() - 0.375).abs() < 1e-12,
+            "3|8 m factor = {}, expected 0.375",
+            v.factor()
+        );
+        assert!(
+            v.base_units().contains('m'),
+            "3|8 m base_units = '{}', expected it to contain 'm'",
+            v.base_units()
+        );
+    }
+
+    /// `per meter` is equivalent to `1/m`; converting between them must give 1.
+    #[test]
+    fn per_keyword_as_division() {
+        ensure_definitions();
+
+        let result = convert("per meter", "1/m");
+
+        assert!(
+            result.is_ok(),
+            "convert(\"per meter\", \"1/m\") failed: {:?}",
+            result.err()
+        );
+        assert!(
+            (result.unwrap() - 1.0).abs() < 1e-9,
+            "convert(\"per meter\", \"1/m\") != 1.0"
+        );
     }
 }

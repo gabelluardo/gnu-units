@@ -1,0 +1,44 @@
+// PEG grammar for GNU units expressions (pest syntax).
+// Operator precedence (lowest → highest): additive, product, power, unary, atom.
+
+// Silent whitespace — consumed between any tokens
+WHITESPACE = _{ " " | "\t" | "\n" | "\r" }
+
+hex_number     = @{ ^"0x" ~ ASCII_HEX_DIGIT+ }
+decimal_number = @{
+    (ASCII_DIGIT* ~ "." ~ ASCII_DIGIT+ ~ (^"e" ~ ("+" | "-")? ~ ASCII_DIGIT+)?
+      | ASCII_DIGIT+ ~ "."? ~ (^"e" ~ ("+" | "-")? ~ ASCII_DIGIT+)?)
+}
+number = { hex_number | decimal_number }
+
+// Unit/function names: start with letter|_|%|$|&|non-ASCII;
+// continue with alphanumeric|_|'|$|&|non-ASCII.
+name = @{
+    (ASCII_ALPHA | "_" | "%" | "$" | "&" | (!ASCII ~ ANY))
+    ~ (ASCII_ALPHANUMERIC | "_" | "'" | "$" | "&" | (!ASCII ~ ANY))*
+}
+
+// `per` keyword — matches only as a complete word, not as a prefix of a longer name.
+per = @{ "per" ~ !(ASCII_ALPHANUMERIC | "_" | "'" | "$" | "&") }
+
+minus  = { "-" }
+add_op = { "+-" | "+" | "-" }
+mul_op = { "*" | "/" | "|" | per }
+pow_op = { "**" | "^" }
+
+expr        = { additive }
+additive    = { product ~ (add_op ~ product)* }
+// juxt_factor guards against treating `+`/`-` as implicit multiplication.
+product     = { power ~ ((mul_op ~ power) | juxt_factor)* }
+juxt_factor = { !add_op ~ power }
+// Exponent is a full unary expression; use parentheses for complex exponents, e.g. `m^(2/3)`.
+power       = { unary ~ (pow_op ~ unary)? }
+// `per` prefix inverts its operand, replicating GNU units' `per` keyword semantics.
+unary       = { (minus | per) ~ unary | atom }
+atom        = { number | tilde_call | func_call | name | group }
+tilde_call  = { "~" ~ name ~ "(" ~ expr ~ ")" }
+arg_list    = { expr ~ ("," ~ expr)* }
+func_call   = { name ~ "(" ~ arg_list? ~ ")" }
+group       = { "(" ~ expr ~ ")" }
+
+input = { SOI ~ expr ~ EOI }
