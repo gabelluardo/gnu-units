@@ -19,18 +19,30 @@ env:
 
 jobs:
     rust-sanity:
-        name: "Rust: Code sanity"
+        name: "Rust: Code sanity (${{ matrix.features }})"
         runs-on: ubuntu-latest
+        strategy:
+            fail-fast: false
+            matrix:
+                features:
+                    - ""
+                    - "--features currency-update"
+                    - "--no-default-features --features vendored"
+                    - "--no-default-features --features vendored,currency-update"
         steps:
             - uses: canonical/desktop-engineering/gh-actions/common/dpkg-install-speedup@main
             - uses: actions/checkout@v4
               with:
                   token: ${{ github.token }}
                   submodules: true
-            - name: Rust code sanity check
-              uses: canonical/desktop-engineering/gh-actions/rust/code-sanity@main
-              with:
-                  token: ${{ github.token }}
+            - name: Install Rust stable toolchain
+              run: rustup update stable
+            - name: Check formatting
+              run: cargo fmt --all -- --check
+            - name: Clippy
+              run: cargo clippy --workspace ${{ matrix.features }} -- -D warnings
+            - name: Clippy (tests)
+              run: cargo clippy --workspace --tests ${{ matrix.features }} -- -D warnings
 
     rust-tests:
         name: "Rust: Tests and coverage (${{ matrix.features }})"
@@ -39,9 +51,11 @@ jobs:
             fail-fast: false
             matrix:
                 features:
-                    - "--no-default-features"
+                    - ""
                     - "--features currency-update"
-                    - "--all-features"
+                    - "--no-default-features --features vendored"
+                    - "--no-default-features --features vendored,bindgen"
+                    - "--no-default-features --features vendored,currency-update"
         steps:
             - uses: canonical/desktop-engineering/gh-actions/common/dpkg-install-speedup@main
             - uses: actions/checkout@v4
