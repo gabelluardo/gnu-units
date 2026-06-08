@@ -40,10 +40,10 @@ fn not_root_err() -> UnitsError {
 
 fn map_parse(e: ParseError) -> UnitsError {
     if e.0.contains("unknown unit") {
-        unknown_unit_err()
-    } else {
-        parse_err()
+        return unknown_unit_err();
     }
+
+    parse_err()
 }
 
 pub(crate) fn unit_new() -> RawUnit {

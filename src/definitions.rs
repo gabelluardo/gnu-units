@@ -18,7 +18,7 @@ use std::sync::Mutex;
 #[cfg(feature = "vendored")]
 use crate::engine::ffi;
 
-#[cfg(not(feature = "vendored"))]
+#[cfg(feature = "native")]
 use crate::engine::native::database::{Database, init as db_init};
 
 use crate::units;
@@ -100,7 +100,7 @@ pub(crate) static DEFINITIONS: LazyLock<RwLock<Vec<Definition>>> = LazyLock::new
         }
     }
 
-    #[cfg(not(feature = "vendored"))]
+    #[cfg(feature = "native")]
     let mut native_db = Database::default();
 
     let content = include_str!("../data/definitions.units");
@@ -108,10 +108,10 @@ pub(crate) static DEFINITIONS: LazyLock<RwLock<Vec<Definition>>> = LazyLock::new
 
     #[cfg(feature = "vendored")]
     let mut defs = load_core(content, c"definitions.units", &mut env);
-    #[cfg(not(feature = "vendored"))]
+    #[cfg(feature = "native")]
     let mut defs = load_core(content, c"definitions.units", &mut env, &mut native_db);
 
-    #[cfg(not(feature = "vendored"))]
+    #[cfg(feature = "native")]
     db_init(native_db);
 
     // Emulate C last-write-wins: reverse so last-in-file entries come first.
@@ -173,7 +173,7 @@ pub(crate) fn load_definitions(content: &str, filename: &std::ffi::CStr) -> Vec<
     {
         load_core(content, filename, &mut env)
     }
-    #[cfg(not(feature = "vendored"))]
+    #[cfg(feature = "native")]
     {
         let _ = filename;
         let db_rw = crate::engine::native::database::get();
@@ -332,7 +332,7 @@ fn include_vendored(
     load_lines_vendored(content, env, file_ptr, utf8mode)
 }
 
-#[cfg(not(feature = "vendored"))]
+#[cfg(feature = "native")]
 fn load_core(
     content: &str,
     _filename: &std::ffi::CStr,
@@ -443,7 +443,7 @@ fn load_core(
     results
 }
 
-#[cfg(not(feature = "vendored"))]
+#[cfg(feature = "native")]
 fn include_native(
     arg: &str,
     env: &mut HashMap<String, String>,

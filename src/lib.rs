@@ -1,7 +1,7 @@
 //! Safe, high-level Rust interface to GNU Units.
 //!
-//! By default this crate uses a pure-Rust unit engine (no C dependency).
-//! Build with `--features vendored` to use the vendored C library instead.
+//! By default this crate uses a native pure-Rust unit engine.
+//! Build with `--no-default-features --features vendored` to use the vendored C library instead.
 
 use std::fmt;
 

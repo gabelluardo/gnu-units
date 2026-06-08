@@ -1,14 +1,20 @@
 //! Backend dispatcher — provides a uniform engine API regardless of backend.
 
+#[cfg(all(feature = "native", feature = "vendored"))]
+compile_error!("Features `native` and `vendored` are mutually exclusive");
+
+#[cfg(not(any(feature = "native", feature = "vendored")))]
+compile_error!("Enable either the `native` or `vendored` feature");
+
 #[cfg(feature = "vendored")]
 pub(crate) mod ffi;
-#[cfg(not(feature = "vendored"))]
+#[cfg(feature = "native")]
 pub(crate) mod native;
 
 // Re-export the active backend's items under a uniform name.
 #[cfg(feature = "vendored")]
 use self::ffi as backend;
-#[cfg(not(feature = "vendored"))]
+#[cfg(feature = "native")]
 use self::native as backend;
 
 pub(crate) use backend::RawUnit;

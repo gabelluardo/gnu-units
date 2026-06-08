@@ -2,7 +2,7 @@
 
 Safe Rust bindings for the [GNU units](https://www.gnu.org/software/units/) conversion library.
 
-This crate provides a high-level Rust API over the vendored GNU units C library, enabling dimensional analysis and unit conversion without spawning external processes.
+This crate provides a high-level Rust API for dimensional analysis and unit conversion. By default it uses a pure-Rust engine with no C dependency. Optionally, a vendored GNU units C library backend is available.
 
 ## Features
 
@@ -11,7 +11,6 @@ This crate provides a high-level Rust API over the vendored GNU units C library,
 - Conformability checking between units
 - List all known unit definitions
 - Optional Rust-native currency rate updates (`currency-update` feature)
-- Statically links vendored GNU units with no system dependencies
 
 ## Usage
 
@@ -47,11 +46,18 @@ assert!(lengths.contains(&"mile".to_string()));
 
 ## Optional features
 
-| Feature              | Description                                                |
-| -------------------- | ---------------------------------------------------------- |
-| `vendored` (default) | Build and statically link the vendored GNU units C sources |
-| `bindgen`            | Regenerate FFI bindings from the C headers                 |
-| `currency-update`    | Enable Rust-native currency exchange rate updates          |
+| Feature            | Description                                                |
+| ------------------ | ---------------------------------------------------------- |
+| `native` (default) | Pure-Rust unit engine, no C dependency                     |
+| `vendored`         | Build and statically link the vendored GNU units C sources |
+| `bindgen`          | Regenerate FFI bindings                                    |
+| `currency-update`  | Enable Rust-native currency exchange rate updates          |
+
+> **Note:** `native` and `vendored` are mutually exclusive. To use the C backend:
+> ```toml
+> [dependencies]
+> gnu-units = { version = "0.1", default-features = false, features = ["vendored"] }
+> ```
 
 ## License
 
