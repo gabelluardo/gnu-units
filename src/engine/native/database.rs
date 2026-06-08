@@ -122,15 +122,10 @@ pub(crate) fn read() -> std::sync::RwLockReadGuard<'static, Database> {
 impl Database {
     pub fn insert_unit(&mut self, name: &str, def: &str) {
         let trimmed = def.trim();
-        let entry = if trimmed.starts_with('!') {
-            let rest = trimmed.trim_start_matches('!').trim();
-            if rest == "dimensionless" {
-                UnitEntry::DimensionlessPrimitive
-            } else {
-                UnitEntry::Primitive
-            }
-        } else {
-            UnitEntry::Derived(trimmed.to_owned())
+        let entry = match trimmed.strip_prefix('!') {
+            Some(rest) if rest.trim() == "dimensionless" => UnitEntry::DimensionlessPrimitive,
+            Some(_) => UnitEntry::Primitive,
+            None => UnitEntry::Derived(trimmed.to_owned()),
         };
         self.units.insert(name.to_owned(), entry);
     }
@@ -268,4 +263,63 @@ fn parse_function_def(param: &str, raw_def: &str) -> Option<FunctionDef> {
         forward: forward.to_owned(),
         reverse,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    /// Returns a string label for the discriminant of a `UnitEntry`.
+    #[track_caller]
+    fn variant_label(entry: &UnitEntry) -> &'static str {
+        match entry {
+            UnitEntry::Primitive => "primitive",
+            UnitEntry::DimensionlessPrimitive => "dimensionless",
+            UnitEntry::Derived(_) => "derived",
+        }
+    }
+
+    #[rstest]
+    #[case::primitive("base", "!", "primitive")]
+    #[case::dimensionless_primitive("rad", "!dimensionless", "dimensionless")]
+    #[case::derived("km", "1000 m", "derived")]
+    fn insert_unit_variant(#[case] name: &str, #[case] def: &str, #[case] expected: &str) {
+        let mut db = Database::default();
+
+        db.insert_unit(name, def);
+
+        let entry = db
+            .units
+            .get(name)
+            .expect("unit should be present after insert");
+        assert_eq!(variant_label(entry), expected);
+    }
+
+    #[test]
+    fn insert_unit_dimensionless_with_interior_spaces() {
+        let mut db = Database::default();
+
+        db.insert_unit("rad", "!  dimensionless");
+
+        let entry = db.units.get("rad").unwrap();
+        assert!(
+            matches!(entry, UnitEntry::DimensionlessPrimitive),
+            "expected DimensionlessPrimitive, got {entry:?}"
+        );
+    }
+
+    #[test]
+    fn insert_unit_derived_stores_trimmed_definition() {
+        let mut db = Database::default();
+
+        db.insert_unit("foo", "  100 kg  ");
+
+        let entry = db.units.get("foo").unwrap();
+        assert!(
+            matches!(entry, UnitEntry::Derived(s) if s == "100 kg"),
+            "expected Derived(\"100 kg\"), got {entry:?}"
+        );
+    }
 }
