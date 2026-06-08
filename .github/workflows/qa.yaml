@@ -33,8 +33,15 @@ jobs:
                   token: ${{ github.token }}
 
     rust-tests:
-        name: "Rust: Tests and coverage"
+        name: "Rust: Tests and coverage (${{ matrix.features }})"
         runs-on: ubuntu-latest
+        strategy:
+            fail-fast: false
+            matrix:
+                features:
+                    - "--no-default-features"
+                    - "--features currency-update"
+                    - "--all-features"
         steps:
             - uses: canonical/desktop-engineering/gh-actions/common/dpkg-install-speedup@main
             - uses: actions/checkout@v4
@@ -48,11 +55,12 @@ jobs:
             - name: Install Rust stable toolchain
               run: rustup update stable
             - name: Run tests
-              run: cargo nextest run --workspace
+              run: cargo nextest run --workspace ${{ matrix.features }}
             - name: Collect coverage
               run: |
                   cargo llvm-cov nextest \
                     --workspace \
+                    ${{ matrix.features }} \
                     --ignore-filename-regex "_test\.rs$" \
                     --lcov \
                     --output-path lcov.info
