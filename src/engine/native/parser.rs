@@ -567,14 +567,23 @@ impl<'db> Evaluator<'db> {
             }
             "ln" => {
                 require_dimensionless("ln", &arg)?;
+                if arg.factor <= 0.0 {
+                    return Err(ParseError::NotInDomain { func: "ln".to_owned(), arg: 1 });
+                }
                 Ok(UnitValue::from_factor(arg.factor.ln()))
             }
             "log" | "log10" => {
                 require_dimensionless("log", &arg)?;
+                if arg.factor <= 0.0 {
+                    return Err(ParseError::NotInDomain { func: "log".to_owned(), arg: 1 });
+                }
                 Ok(UnitValue::from_factor(arg.factor.log10()))
             }
             "log2" => {
                 require_dimensionless("log2", &arg)?;
+                if arg.factor <= 0.0 {
+                    return Err(ParseError::NotInDomain { func: "log2".to_owned(), arg: 1 });
+                }
                 Ok(UnitValue::from_factor(arg.factor.log2()))
             }
 
@@ -834,6 +843,9 @@ impl<'db> Evaluator<'db> {
                     };
                     if base > 1.0 {
                         require_dimensionless(name, &arg)?;
+                        if arg.factor <= 0.0 {
+                            return Err(ParseError::NotInDomain { func: name.to_owned(), arg: 1 });
+                        }
                         return Ok(UnitValue::from_factor(arg.factor.ln() / base.ln()));
                     }
                 }
