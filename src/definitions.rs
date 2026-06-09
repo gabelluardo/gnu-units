@@ -38,6 +38,17 @@ pub enum DefinitionKind {
     Alias,
 }
 
+impl DefinitionKind {
+    fn from_name(name: &str) -> DefinitionKind {
+        match name {
+            _ if name.ends_with('-') => DefinitionKind::Prefix,
+            _ if name.contains('[') => DefinitionKind::Table,
+            _ if name.contains('(') => DefinitionKind::Function,
+            _ => DefinitionKind::Unit,
+        }
+    }
+}
+
 /// A single entry from the GNU units definitions database.
 #[derive(Debug, Clone, Eq)]
 pub struct Definition {
@@ -304,7 +315,7 @@ fn load_lines_vendored(
         results.push(Definition {
             name: name.to_owned(),
             definition: def.to_owned(),
-            kind: classify(name),
+            kind: DefinitionKind::from_name(name),
         });
     }
     results
@@ -437,7 +448,7 @@ fn load_core(
         results.push(Definition {
             name: name.to_owned(),
             definition: def.to_owned(),
-            kind: classify(name),
+            kind: DefinitionKind::from_name(name),
         });
     }
     results
@@ -489,7 +500,6 @@ fn strip_comment(line: &str) -> &str {
     if let Some(pos) = line.find('#') {
         return &line[..pos];
     }
-
     line
 }
 
@@ -502,13 +512,4 @@ fn split2(s: &str) -> (&str, &str) {
 
 fn lookup_var(name: &str, env: &HashMap<String, String>) -> Option<String> {
     env.get(name).cloned().or_else(|| std::env::var(name).ok())
-}
-
-fn classify(name: &str) -> DefinitionKind {
-    match name {
-        _ if name.ends_with('-') => DefinitionKind::Prefix,
-        _ if name.contains('[') => DefinitionKind::Table,
-        _ if name.contains('(') => DefinitionKind::Function,
-        _ => DefinitionKind::Unit,
-    }
 }
