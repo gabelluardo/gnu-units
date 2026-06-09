@@ -20,6 +20,8 @@ fn map_parse(e: ParseError) -> UnitsError {
         ParseError::NotInDomain { .. } => UnitsError(ErrorCode::NotInDomain),
         ParseError::WrongDimensions { .. } => UnitsError(ErrorCode::BadFuncArg),
         ParseError::IrrationalExponent => UnitsError(ErrorCode::IrrationalExponent),
+        ParseError::NotDivisibleByRoot => UnitsError(ErrorCode::NotRoot),
+        ParseError::IncompatibleDimensions(_) => UnitsError(ErrorCode::BadSum),
         _ => UnitsError(ErrorCode::Parse),
     }
 }
@@ -140,7 +142,7 @@ pub(crate) fn convert_func(from: &str, to: &str) -> crate::Result<f64> {
             let mut ratio = from_val;
             ratio.divide_assign(&unit_val);
             if !ratio.is_dimensionless() {
-                return Err(UnitsError(ErrorCode::NotInDomain));
+                return Err(UnitsError(ErrorCode::BadFuncArg));
             }
             let db = database::read();
             let table = db.tables.get(to).ok_or(UnitsError(ErrorCode::NotAFunc))?;
