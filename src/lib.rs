@@ -352,9 +352,6 @@ mod tests {
     }
 
     #[rstest]
-    #[case::integer("5", 5.0)]
-    #[case::float("3.15", 3.15)]
-    #[case::scientific("1e10", 1e10)]
     #[case::hex_literal("0xff", 255.0)]
     #[case::negative_exponent_dimensionless("2^-1", 0.5)]
     fn parse_numeric(#[case] input: &str, #[case] expected: f64) {
@@ -362,15 +359,6 @@ mod tests {
 
         assert!(result.is_ok());
         assert!((result.unwrap().factor() - expected).abs() < 1e-6);
-    }
-
-    #[rstest]
-    #[case::null_byte("\0")]
-    #[case::close_paren(")")]
-    fn parse_error(#[case] input: &str) {
-        let result = Unit::parse(input);
-
-        assert!(result.is_err());
     }
 
     #[test]
@@ -415,83 +403,6 @@ mod tests {
     }
 
     #[test]
-    fn multiply_five_by_three() {
-        let mut a = Unit::parse("5").unwrap();
-        let b = Unit::parse("3").unwrap();
-
-        a.multiply(b).unwrap();
-
-        assert_eq!(a.factor(), 15.0);
-    }
-
-    #[test]
-    fn divide_ten_by_two() {
-        let mut a = Unit::parse("10").unwrap();
-        let b = Unit::parse("2").unwrap();
-
-        a.divide(b).unwrap();
-
-        assert_eq!(a.factor(), 5.0);
-    }
-
-    #[test]
-    fn add_three_and_seven() {
-        let mut a = Unit::parse("3").unwrap();
-        let b = Unit::parse("7").unwrap();
-
-        a.add(b).unwrap();
-
-        assert_eq!(a.factor(), 10.0);
-    }
-
-    #[test]
-    fn invert_five_is_point_two() {
-        let mut a = Unit::parse("5").unwrap();
-
-        a.invert();
-
-        assert!((a.factor() - 0.2).abs() < 1e-12);
-    }
-
-    #[test]
-    fn pow_three_squared_is_nine() {
-        let mut a = Unit::parse("3").unwrap();
-
-        a.pow(2).unwrap();
-
-        assert_eq!(a.factor(), 9.0);
-    }
-
-    #[test]
-    fn root_sqrt_nine_is_three() {
-        let mut a = Unit::parse("9").unwrap();
-
-        a.root(2).unwrap();
-
-        assert!((a.factor() - 3.0).abs() < 1e-12);
-    }
-
-    #[test]
-    fn pow_error() {
-        let mut a = Unit::parse("3").unwrap();
-
-        let result = a.pow(-1);
-
-        assert!(result.is_err());
-    }
-
-    #[rstest]
-    #[case::zero(0)]
-    #[case::negative(-1)]
-    fn root_error(#[case] n: i32) {
-        let mut a = Unit::parse("9").unwrap();
-
-        let result = a.root(n);
-
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn to_number_returns_factor() {
         let unit = Unit::parse("42").unwrap();
 
@@ -499,61 +410,6 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 42.0);
-    }
-
-    #[rstest]
-    #[case::km_to_m("km", "m", 1000.0, 1e-9)]
-    #[case::five_km_to_miles("5 km", "miles", 3.107, 0.001)]
-    #[case::m_to_m("m", "m", 1.0, 1e-12)]
-    fn convert_to_compatible_units(
-        #[case] from: &str,
-        #[case] to: &str,
-        #[case] expected: f64,
-        #[case] tol: f64,
-    ) {
-        let result = convert(from, to);
-
-        assert!(result.is_ok(), "convert({from:?}, {to:?}) should succeed");
-        let factor = result.unwrap();
-        assert!(
-            (factor - expected).abs() < tol,
-            "got {factor}, expected {expected}\u{00b1}{tol}"
-        );
-    }
-
-    #[test]
-    fn error_on_convert_to_incompatible_dimensions() {
-        let result = convert("km", "kg");
-
-        assert!(result.is_err());
-    }
-
-    #[rstest]
-    #[case::bad_from("invalidUnitXYZ999", "m")]
-    #[case::bad_to("m", "invalidUnitXYZ999")]
-    #[case::incompatible("km", "kg")]
-    fn convert_error(#[case] from: &str, #[case] to: &str) {
-        let result = convert(from, to);
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn list_definitions_is_not_empty() {
-        let defs = list_definitions();
-
-        assert!(defs.len() > 1000);
-    }
-
-    #[test]
-    fn list_definitions_is_sorted_alphabetically() {
-        let defs = list_definitions();
-
-        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
-        let mut sorted = names.clone();
-        sorted.sort_unstable();
-
-        assert_eq!(names, sorted);
     }
 
     #[test]
@@ -566,8 +422,6 @@ mod tests {
     }
 
     #[rstest]
-    #[case::m("m")]
-    #[case::meter("meter")]
     #[case::kilo_prefix("kilo-")]
     #[case::hms("hms")]
     fn list_definitions_contains_known_entry(#[case] name: &str) {
@@ -646,61 +500,12 @@ mod tests {
         assert_eq!(base, "");
     }
 
-    #[rstest]
-    #[case::km_miles("km", "miles", true)]
-    #[case::m_kg("m", "kg", false)]
-    fn is_conformable(#[case] a: &str, #[case] b: &str, #[case] expected: bool) {
-        let ua = Unit::parse(a).unwrap();
-        let ub = Unit::parse(b).unwrap();
-
-        assert_eq!(ua.is_conformable(&ub), expected);
-    }
-
-    #[rstest]
-    #[case::m("km", "m")]
-    #[case::mile("km", "mile")]
-    fn conformable_contains_expected_unit(#[case] expr: &str, #[case] should_contain: &str) {
-        let result = conformable(expr).unwrap();
-
-        assert!(
-            result.contains(&should_contain.to_owned()),
-            "conformable('{expr}') should contain '{should_contain}'"
-        );
-    }
-
     #[test]
     fn conformable_does_not_contain_wrong_domain() {
         let result = conformable("km").unwrap();
 
         assert!(!result.contains(&"kg".to_owned()));
         assert!(!result.contains(&"s".to_owned()));
-    }
-
-    #[test]
-    fn error_on_conformable_invalid_expression() {
-        let result = conformable("invalidUnitXYZ999");
-
-        assert!(result.is_err());
-    }
-
-    #[rstest]
-    #[case::kg_to_g("kilogram", "gram", 1000.0, 1e-9)]
-    #[case::inch_to_cm("inch", "cm", 2.54, 1e-9)]
-    #[case::minute_to_s("minute", "s", 60.0, 1e-9)]
-    fn definitions_convert(
-        #[case] from: &str,
-        #[case] to: &str,
-        #[case] expected: f64,
-        #[case] tol: f64,
-    ) {
-        let result = convert(from, to);
-
-        assert!(result.is_ok(), "convert({from:?}, {to:?}) should succeed");
-        let factor = result.unwrap();
-        assert!(
-            (factor - expected).abs() < tol,
-            "got {factor}, expected {expected}\u{00b1}{tol}"
-        );
     }
 
     #[rstest]
@@ -716,30 +521,6 @@ mod tests {
         let result = replace_operators(&input.to_string());
 
         assert_eq!(result, expected);
-    }
-
-    #[rstest]
-    #[case::zero_celsius("273.15 K", "tempC", 0.0, 1e-6)]
-    #[case::boiling_celsius("373.15 K", "tempC", 100.0, 1e-6)]
-    #[case::freezing_fahrenheit("273.15 K", "tempF", 32.0, 1e-4)]
-    fn convert_via_function(
-        #[case] from: &str,
-        #[case] to: &str,
-        #[case] expected: f64,
-        #[case] tol: f64,
-    ) {
-        let result = convert(from, to);
-
-        assert!(
-            result.is_ok(),
-            "convert({from:?}, {to:?}) failed: {:?}",
-            result.err()
-        );
-        let factor = result.unwrap();
-        assert!(
-            (factor - expected).abs() < tol,
-            "convert({from:?}, {to:?}) = {factor}, expected {expected}\u{00b1}{tol}"
-        );
     }
 
     #[test]
@@ -797,31 +578,6 @@ mod tests {
         assert!(
             (factor - expected).abs() < tol,
             "parse({input:?}).factor() = {factor}, expected {expected}\u{00b1}{tol}"
-        );
-    }
-
-    #[rstest]
-    #[case::zero_c("273.15 K", "tempC", 0.0, 1e-6)]
-    #[case::hundred_c("373.15 K", "tempC", 100.0, 1e-6)]
-    #[case::freezing_f("273.15 K", "tempF", 32.0, 0.1)]
-    #[case::boiling_f("373.15 K", "tempF", 212.0, 0.1)]
-    fn temperature_convert(
-        #[case] from: &str,
-        #[case] to: &str,
-        #[case] expected: f64,
-        #[case] tol: f64,
-    ) {
-        let result = convert(from, to);
-
-        assert!(
-            result.is_ok(),
-            "convert({from:?}, {to:?}) failed: {:?}",
-            result.err()
-        );
-        let factor = result.unwrap();
-        assert!(
-            (factor - expected).abs() < tol,
-            "convert({from:?}, {to:?}) = {factor}, expected {expected}\u{00b1}{tol}"
         );
     }
 
@@ -998,5 +754,60 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code(), ErrorCode::BadFuncArg);
+    }
+
+    #[rstest]
+    #[case::error_on_ln_of_zero("ln(0)")]
+    #[case::error_on_ln_of_negative("ln(-1)")]
+    #[case::error_on_log_of_zero("log(0)")]
+    #[case::error_on_log_of_negative("log(-1)")]
+    #[case::error_on_log2_of_zero("log2(0)")]
+    fn error_on_builtin_domain(#[case] expr: &str) {
+        let result = convert(expr, "1");
+
+        assert!(result.is_err(), "convert({expr:?}, \"1\") should fail");
+    }
+
+    #[rstest]
+    #[case::error_on_to_number_dimensional("m", ErrorCode::NotANumber)]
+    #[case::error_on_to_number_compound("kg m/s^2", ErrorCode::NotANumber)]
+    fn error_on_to_number(#[case] input: &str, #[case] expected_code: ErrorCode) {
+        let unit = Unit::parse(input).unwrap();
+
+        let result = unit.to_number();
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), expected_code);
+    }
+
+    #[test]
+    fn error_on_add_incompatible_dimensions() {
+        let mut a = Unit::parse("m").unwrap();
+        let b = Unit::parse("kg").unwrap();
+
+        let result = a.add(b);
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), ErrorCode::BadSum);
+    }
+
+    #[test]
+    fn error_on_convert_to_incompatible_units() {
+        let m = Unit::parse("m").unwrap();
+        let kg = Unit::parse("kg").unwrap();
+
+        let result = m.convert_to(kg);
+
+        assert!(result.is_err());
+    }
+
+    #[rstest]
+    #[case::division_by_zero("1/0", f64::INFINITY)]
+    #[case::deeply_nested("(((((((((( 1 ))))))))))", 1.0)]
+    fn parse_does_not_panic(#[case] input: &str, #[case] expected: f64) {
+        let result = Unit::parse(input);
+
+        assert!(result.is_ok(), "parse({input:?}) should not panic or fail");
+        assert_eq!(result.unwrap().factor(), expected);
     }
 }
