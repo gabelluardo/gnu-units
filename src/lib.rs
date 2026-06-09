@@ -86,13 +86,11 @@ impl UnitsError {
     }
 
     /// Returns `true` when the error indicates a dimensionless reduction failed.
-    #[cfg(test)]
     pub fn is_not_dimensionless(&self) -> bool {
         self.0 == ErrorCode::NotANumber
     }
 
     /// Returns `true` when the expression was invalid (unknown/unparseable).
-    #[cfg(test)]
     pub fn is_invalid_unit(&self) -> bool {
         self.0 == ErrorCode::UnknownUnit || self.0 == ErrorCode::Parse
     }
