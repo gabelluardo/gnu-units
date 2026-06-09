@@ -1,4 +1,4 @@
-use gnu_units::{Unit, conformable, convert, list_definitions};
+use gnu_units::{ErrorCode, Unit, conformable, convert, list_definitions};
 use rstest::rstest;
 
 #[rstest]
@@ -259,4 +259,119 @@ fn base_units_of_dimensionless_is_empty() {
     let result = unit.base_units();
 
     assert_eq!(result, "");
+}
+
+#[rstest]
+#[case::half("1|2", 0.5)]
+#[case::three_eighths("3|8", 0.375)]
+fn parse_pipe_operator(#[case] input: &str, #[case] expected: f64) {
+    let unit = Unit::parse(input).unwrap();
+
+    assert!((unit.factor() - expected).abs() < 1e-12);
+}
+
+#[test]
+fn per_keyword_inverts() {
+    let result = convert("per meter", "1/m");
+
+    assert!(result.is_ok());
+    assert!((result.unwrap() - 1.0).abs() < 1e-9);
+}
+
+#[test]
+fn parse_hex_literal() {
+    let unit = Unit::parse("0xff").unwrap();
+
+    assert_eq!(unit.factor(), 255.0);
+}
+
+#[test]
+fn parse_malformed_hex_is_zero() {
+    let unit = Unit::parse("0xGG").unwrap();
+
+    assert_eq!(unit.factor(), 0.0);
+}
+
+#[test]
+fn error_on_unary_plus() {
+    let result = Unit::parse("+5");
+
+    assert!(result.is_err());
+}
+
+#[rstest]
+#[case::sqrt("sqrt(9)", 3.0)]
+#[case::cuberoot("cuberoot(27)", 3.0)]
+#[case::abs("abs(-5)", 5.0)]
+fn parse_builtin_function(#[case] input: &str, #[case] expected: f64) {
+    let unit = Unit::parse(input).unwrap();
+
+    assert!((unit.factor() - expected).abs() < 1e-9);
+}
+
+#[rstest]
+#[case::tempc_0("tempC(0)", "K", 273.15, 0.01)]
+#[case::tempf_212("tempF(212)", "K", 373.15, 0.01)]
+fn forward_function_convert(
+    #[case] from: &str,
+    #[case] to: &str,
+    #[case] expected: f64,
+    #[case] tol: f64,
+) {
+    let result = convert(from, to);
+
+    assert!(
+        result.is_ok(),
+        "convert({from:?}, {to:?}) failed: {:?}",
+        result.err()
+    );
+    assert!((result.unwrap() - expected).abs() < tol);
+}
+
+#[test]
+fn inverse_function_tilde() {
+    let unit = Unit::parse("~tempC(0 K)").unwrap();
+
+    assert!((unit.factor() - (-273.15)).abs() < 0.01);
+}
+
+#[test]
+fn table_lookup_gasmark() {
+    let result = convert("gasmark(5)", "degR");
+
+    assert!(result.is_ok());
+    assert!((result.unwrap() - 834.67).abs() < 0.1);
+}
+
+#[rstest]
+#[case::kilo("kilogram", "gram", 1000.0)]
+#[case::milli("milligram", "gram", 0.001)]
+#[case::micro("microsecond", "second", 1e-6)]
+fn prefix_resolution(#[case] from: &str, #[case] to: &str, #[case] expected: f64) {
+    let result = convert(from, to);
+
+    assert!(result.is_ok());
+    assert!((result.unwrap() - expected).abs() < expected.abs() * 1e-9);
+}
+
+#[test]
+fn fractional_exponent_dimensionless() {
+    let unit = Unit::parse("8^(1|3)").unwrap();
+
+    assert!((unit.factor() - 2.0).abs() < 1e-9);
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn error_code_on_unknown_unit() {
+    let err = Unit::parse("invalidUnitXYZ999").err().unwrap();
+
+    assert_eq!(err.code(), ErrorCode::UnknownUnit);
+}
+
+#[test]
+fn error_code_on_incompatible_add() {
+    let result = convert("m + kg", "m");
+
+    assert_eq!(result.unwrap_err().code(), ErrorCode::BadSum);
 }

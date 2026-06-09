@@ -969,4 +969,34 @@ mod tests {
             "convert(\"per meter\", \"1/m\") != 1.0"
         );
     }
+
+    #[test]
+    fn add_incompatible_dimensions_returns_badsum() {
+        let result = convert("m + kg", "m");
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), ErrorCode::BadSum);
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn non_divisible_root_returns_not_root() {
+        ensure_definitions();
+
+        let result = Unit::parse("m^(1|3)");
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), ErrorCode::NotRoot);
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn table_dimension_mismatch_returns_bad_func_arg() {
+        ensure_definitions();
+
+        let result = convert("5 m", "gasmark");
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), ErrorCode::BadFuncArg);
+    }
 }
