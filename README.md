@@ -16,7 +16,7 @@ This crate provides a high-level Rust API for dimensional analysis and unit conv
 
 ```toml
 [dependencies]
-gnu-units = "0.1"
+gnu-units = "0.2"
 ```
 
 ```rust
@@ -64,7 +64,7 @@ match err.code() {
 > **Note:** `native` and `vendored` are mutually exclusive. To use the C backend:
 > ```toml
 > [dependencies]
-> gnu-units = { version = "0.1", default-features = false, features = ["vendored"] }
+> gnu-units = { version = "0.2", default-features = false, features = ["vendored"] }
 > ```
 
 ## License
