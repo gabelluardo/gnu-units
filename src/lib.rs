@@ -228,7 +228,15 @@ pub fn convert(from: &str, to: &str) -> Result<f64> {
         Err(e) if e.code() == ErrorCode::NotAFunc => {}
         result => return result,
     }
-    Unit::parse(from)?.convert_to(Unit::parse(to)?)
+    let from_unit = Unit::parse(from).or_else(|e| {
+        if e.code() != ErrorCode::Parse && e.code() != ErrorCode::UnknownUnit {
+            return Err(e);
+        }
+        from.rsplit_once(' ')
+            .ok_or(e)
+            .and_then(|(arg, func)| Unit::parse(&format!("{func}({arg})")))
+    })?;
+    from_unit.convert_to(Unit::parse(to)?)
 }
 
 /// Returns all unit definitions conformable with `expr` in alphabetical order.

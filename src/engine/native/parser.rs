@@ -318,7 +318,9 @@ impl<'db> Evaluator<'db> {
                     if result.is_dimensionless() && result.factor == 0.0 {
                         match self.eval_power(inner_power) {
                             Ok(rhs) => result.multiply_assign(&rhs),
-                            Err(ParseError::UnknownUnit(_)) => {}
+                            Err(ParseError::UnknownUnit(ref name))
+                                if !self.db.functions.contains_key(name)
+                                    && !self.db.tables.contains_key(name) => {}
                             Err(e) => return Err(e),
                         }
                         continue;

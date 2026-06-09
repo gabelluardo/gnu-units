@@ -107,11 +107,6 @@ pub(crate) fn convert_func(from: &str, to: &str) -> crate::Result<f64> {
         Table(String),
     }
 
-    let from_val = match parser_parseunit(from) {
-        Ok(v) => v,
-        Err(e) => return Err(map_parse(e)),
-    };
-
     let lookup = {
         let db = database::read();
         if let Some(func) = db.functions.get(to) {
@@ -126,6 +121,11 @@ pub(crate) fn convert_func(from: &str, to: &str) -> crate::Result<f64> {
     };
 
     let lookup = lookup.ok_or(UnitsError(ErrorCode::NotAFunc))?;
+
+    let from_val = match parser_parseunit(from) {
+        Ok(v) => v,
+        Err(_) => return Err(UnitsError(ErrorCode::NotAFunc)),
+    };
 
     match lookup {
         FuncLookup::Function(reverse) => {

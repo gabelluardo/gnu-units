@@ -70,6 +70,7 @@ fn error_on_convert_incompatible(#[case] from: &str, #[case] to: &str) {
 #[case::freezing_point_celsius("273.15 K", "tempC", 0.0, 1e-6)]
 #[case::boiling_point_celsius("373.15 K", "tempC", 100.0, 1e-6)]
 #[case::freezing_point_fahrenheit("273.15 K", "tempF", 32.0, 1e-6)]
+#[case::zero_celsius_to_kelvin("0 tempC", "tempK", 273.15, 1e-6)]
 fn convert_temperature(
     #[case] from: &str,
     #[case] to: &str,
