@@ -17,19 +17,25 @@ keywords = ["gnu", "units", "conversion", "physics", "currency"]
 include = ["src/**", "data/**", "Cargo.toml", "README.md", "LICENSE"]
 
 [features]
-default = ["gnu-units-sys/default"]
+default = ["native"]
 
-# Build and statically link to vendored units sources.
-vendored = ["gnu-units-sys/vendored"]
+# Use the pure-Rust unit engine.
+native = ["dep:pest", "dep:pest_derive"]
 
-# Regenerate checked-in FFI bindings.
-bindgen = ["gnu-units-sys/bindgen"]
+# Use the vendored C library via gnu-units-sys.
+vendored = ["dep:gnu-units-sys", "gnu-units-sys/vendored"]
+
+# Regenerate checked-in FFI bindings (developer-only meaningful with vendored).
+bindgen = ["gnu-units-sys?/bindgen"]
 
 # Enable Rust-native emulation of units_cur currency update logic.
 currency-update = ["dep:reqwest", "dep:serde", "dep:serde_json", "dep:chrono"]
 
 [dependencies]
-gnu-units-sys = { version = "2.27", path = "gnu-units-sys", default-features = false }
+gnu-units-sys = { version = "2.27", path = "gnu-units-sys", default-features = false, optional = true }
+pest = { version = "2", optional = true }
+pest_derive = { version = "2", optional = true }
+thiserror = "2"
 reqwest = { version = "0.13", default-features = false, features = [
     "blocking",
     "json",

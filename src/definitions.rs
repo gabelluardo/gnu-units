@@ -1,59 +1,27 @@
-//! Parses the embedded `definitions.units` file and registers entries via FFI.
+//! Parses the embedded `definitions.units` file and registers entries into
+//! either the vendored C-library database (via FFI) or the pure-Rust native
+//! database, depending on the active feature.
 //!
-//! Handles prefixes, tables, functions, units, and aliases, producing a sorted
-//! [`Vec<Definition>`] used by the public API.
+//! Produces a sorted [`Vec<Definition>`] exposed through the public API.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::{LazyLock, RwLock};
+
+#[cfg(feature = "vendored")]
 use std::ffi::{CStr, CString};
+#[cfg(feature = "vendored")]
 use std::os::raw::c_int;
-use std::sync::{LazyLock, Mutex, RwLock};
+#[cfg(feature = "vendored")]
+use std::sync::Mutex;
 
-use crate::ffi;
+#[cfg(feature = "vendored")]
+use crate::engine::ffi;
+
+#[cfg(feature = "native")]
+use crate::engine::native::database::{Database, init as db_init};
+
 use crate::units;
-
-/// Loads the embedded GNU units definitions exactly once into the C library's
-/// global database.
-///
-/// `DEFINITIONS` is a [`LazyLock`] whose initialiser parses the compile-time embedded
-/// `definitions.units` content and registers each unit, prefix, table, and
-/// function directly with the C library's global hash tables. The `RwLock`
-/// allows [`reload_currency`] to update the list at runtime.
-pub(crate) static DEFINITIONS: LazyLock<RwLock<Vec<Definition>>> = LazyLock::new(|| {
-    {
-        let _guard = ffi::lock();
-        // SAFETY: mylocale/progname point to static C strings that live for the
-        // duration of the process. utf8mode is a plain C int. LazyLock guarantees
-        // this closure runs at most once, so no other FFI call can observe the
-        // globals mid-write.
-        unsafe {
-            gnu_units_sys::mylocale = c"en_US".as_ptr() as *mut std::os::raw::c_char;
-            gnu_units_sys::progname = c"gnu-units".as_ptr() as *mut std::os::raw::c_char;
-            gnu_units_sys::utf8mode = 1;
-        }
-    }
-
-    let definitions = include_str!("../data/definitions.units");
-    let mut defs = load_definitions(definitions, c"definitions.units");
-    // Emulate C last-write-wins: reverse so last-in-file entries come first
-    defs.reverse();
-    // Stable sort by canonical_name + kind; preserves reverse order within each group
-    defs.sort();
-    // Remove duplicates; keeps first of each group = last-in-file entry
-    defs.dedup();
-    // Final alphabetical ordering for the public API
-    defs.sort_by(|a, b| a.name.cmp(&b.name));
-    RwLock::new(defs)
-});
-
-/// Ensures the GNU units definitions are loaded exactly once.
-///
-/// Forces the [`DEFINITIONS`] lazy initialiser, which embeds `definitions.units` at
-/// compile time and loads it into the C library's global definitions on first
-/// call. All subsequent calls are instant no-ops.
-pub(crate) fn ensure_definitions() {
-    LazyLock::force(&DEFINITIONS);
-}
 
 /// The kind of a definition entry in the GNU units database.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -68,6 +36,17 @@ pub enum DefinitionKind {
     Table,
     /// A unit list alias (defined via `!unitlist`).
     Alias,
+}
+
+impl DefinitionKind {
+    fn from_name(name: &str) -> DefinitionKind {
+        match name {
+            _ if name.ends_with('-') => DefinitionKind::Prefix,
+            _ if name.contains('[') => DefinitionKind::Table,
+            _ if name.contains('(') => DefinitionKind::Function,
+            _ => DefinitionKind::Unit,
+        }
+    }
 }
 
 /// A single entry from the GNU units definitions database.
@@ -102,13 +81,11 @@ impl PartialOrd for Definition {
 }
 
 impl Definition {
-    /// Returns the canonical lookup name used by the C library for deduplication.
-    ///
-    /// The C library normalizes names before hash-table lookup:
-    /// - Prefixes: trailing `-` is removed (`kilo-` → `kilo`)
-    /// - Functions: everything from `(` onward is stripped (`tempC(x)` → `tempC`)
-    /// - Tables: everything from `[` onward is stripped (`gasmark[degR]` → `gasmark`)
-    /// - Units and aliases: the full name is used as-is
+    /// Returns the canonical lookup name used for deduplication:
+    /// - Prefixes: trailing `-` stripped (`kilo-` → `kilo`)
+    /// - Functions: stripped from `(` onward (`tempC(x)` → `tempC`)
+    /// - Tables: stripped from `[` onward (`gasmark[degR]` → `gasmark`)
+    /// - Units and aliases: full name as-is
     pub fn canonical_name(&self) -> &str {
         if let Some(idx) = self.name.find('(') {
             &self.name[..idx]
@@ -118,6 +95,61 @@ impl Definition {
             self.name.trim_end_matches('-')
         }
     }
+}
+
+/// Sorted list of all known definitions, populated once at start-up.
+pub(crate) static DEFINITIONS: LazyLock<RwLock<Vec<Definition>>> = LazyLock::new(|| {
+    #[cfg(feature = "vendored")]
+    {
+        let _guard = ffi::lock();
+        // SAFETY: static C strings live for the process lifetime.
+        // LazyLock guarantees single-threaded execution here.
+        unsafe {
+            gnu_units_sys::mylocale = c"en_US".as_ptr() as *mut std::os::raw::c_char;
+            gnu_units_sys::progname = c"gnu-units".as_ptr() as *mut std::os::raw::c_char;
+            gnu_units_sys::utf8mode = 1;
+        }
+    }
+
+    #[cfg(feature = "native")]
+    let mut native_db = Database::default();
+
+    let content = include_str!("../data/definitions.units");
+    let mut env: HashMap<String, String> = HashMap::new();
+
+    #[cfg(feature = "vendored")]
+    let mut defs = load_core(content, c"definitions.units", &mut env);
+    #[cfg(feature = "native")]
+    let mut defs = load_core(content, c"definitions.units", &mut env, &mut native_db);
+
+    #[cfg(feature = "native")]
+    db_init(native_db);
+
+    // Emulate C last-write-wins: reverse so last-in-file entries come first.
+    defs.reverse();
+    defs.sort();
+    defs.dedup();
+    defs.sort_by(|a, b| a.name.cmp(&b.name));
+    RwLock::new(defs)
+});
+
+/// Forces the definitions to be loaded exactly once.
+pub(crate) fn ensure_definitions() {
+    LazyLock::force(&DEFINITIONS);
+}
+
+#[cfg(feature = "vendored")]
+static FILE_PTRS: LazyLock<Mutex<HashMap<Vec<u8>, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(feature = "vendored")]
+fn intern_filename(filename: &CStr) -> *mut std::os::raw::c_char {
+    let key = filename.to_bytes().to_vec();
+    let mut map = FILE_PTRS.lock().unwrap_or_else(|e| e.into_inner());
+    let addr = *map
+        .entry(key)
+        .or_insert_with(|| CString::new(filename.to_bytes()).unwrap().into_raw() as usize);
+    addr as *mut std::os::raw::c_char
 }
 
 pub(crate) fn replace_operators(s: &str) -> String {
@@ -145,80 +177,53 @@ pub(crate) fn replace_operators(s: &str) -> String {
     out
 }
 
+#[cfg_attr(not(feature = "currency-update"), allow(dead_code))]
 pub(crate) fn load_definitions(content: &str, filename: &std::ffi::CStr) -> Vec<Definition> {
     let mut env: HashMap<String, String> = HashMap::new();
-    load_definitions_inner(content, filename, &mut env)
+    #[cfg(feature = "vendored")]
+    {
+        load_core(content, filename, &mut env)
+    }
+    #[cfg(feature = "native")]
+    {
+        let _ = filename;
+        let db_rw = crate::engine::native::database::get();
+        let mut db = db_rw.write().unwrap_or_else(|e| e.into_inner());
+        load_core(content, c"", &mut env, &mut db)
+    }
 }
 
-fn lookup_var(name: &str, env: &HashMap<String, String>) -> Option<String> {
-    env.get(name).cloned().or_else(|| std::env::var(name).ok())
-}
-
-static FILE_PTRS: LazyLock<Mutex<HashMap<Vec<u8>, usize>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn intern_filename(filename: &CStr) -> *mut std::os::raw::c_char {
-    let key = filename.to_bytes().to_vec();
-    let mut map = FILE_PTRS.lock().unwrap_or_else(|e| e.into_inner());
-    let addr = *map
-        .entry(key)
-        .or_insert_with(|| CString::new(filename.to_bytes()).unwrap().into_raw() as usize);
-    addr as *mut std::os::raw::c_char
-}
-
-fn load_definitions_inner(
+#[cfg(feature = "vendored")]
+fn load_core(
     content: &str,
     filename: &std::ffi::CStr,
     env: &mut HashMap<String, String>,
 ) -> Vec<Definition> {
-    // SAFETY: each unique filename CString is leaked once, giving the C library
-    // a stable pointer it can retain for the process lifetime.
     let file_ptr = intern_filename(filename);
+    // SAFETY: utf8mode is a simple i32 global set during initialization.
+    // It is only read here after initialization is complete.
+    let utf8mode = unsafe { gnu_units_sys::utf8mode };
+    load_lines_vendored(content, env, file_ptr, utf8mode)
+}
 
-    let mut results: Vec<Definition> = Vec::new();
+#[cfg(feature = "vendored")]
+fn load_lines_vendored(
+    content: &str,
+    env: &mut HashMap<String, String>,
+    file_ptr: *mut std::os::raw::c_char,
+    utf8mode: i32,
+) -> Vec<Definition> {
+    let mut results = Vec::new();
     let mut wrong_locale = false;
     let mut in_utf8 = false;
     let mut wrong_var = false;
-    let utf8mode = unsafe { gnu_units_sys::utf8mode };
 
-    // Join continuation lines first, then process
-    let joined_lines = {
-        let mut lines = Vec::new();
-        let mut iter = content.lines().enumerate();
-        while let Some((idx, line)) = iter.next() {
-            // Strip UTF-8 BOM from first line
-            let line = if idx == 0 {
-                line.trim_start_matches('\u{FEFF}')
-            } else {
-                line
-            };
-            let mut buf = line.to_string();
-            while buf.ends_with('\\')
-                && let Some((_, next)) = iter.next()
-            {
-                buf.pop();
-                buf.push_str(next.trim_start());
-            }
-            lines.push((idx + 1, buf));
-        }
-        lines
-    };
-
-    for (linenum, raw_line) in &joined_lines {
-        // Strip comments
-        let line = if let Some(pos) = raw_line.find('#') {
-            &raw_line[..pos]
-        } else {
-            raw_line.as_str()
-        };
+    for (linenum, raw_line) in join_continuations(content) {
+        let line = strip_comment(&raw_line);
         let line = line.trim();
 
         if let Some(rest) = line.strip_prefix('!') {
-            let rest = rest.trim();
-            let mut parts = rest.splitn(2, char::is_whitespace);
-            let directive = parts.next().unwrap_or("");
-            let arg = parts.next().unwrap_or("").trim();
-
+            let (directive, arg) = split2(rest.trim());
             match directive {
                 "locale" => {
                     wrong_locale = arg != "en_US";
@@ -233,83 +238,45 @@ fn load_definitions_inner(
                     in_utf8 = false;
                 }
                 "var" => {
-                    let mut tokens = arg.splitn(2, char::is_whitespace);
-                    let varname = tokens.next().unwrap_or("");
-                    let values = tokens.next().unwrap_or("").trim();
-                    match lookup_var(varname, env) {
-                        Some(val) => {
-                            wrong_var = !values.split_whitespace().any(|v| v == val);
-                        }
-                        None => wrong_var = true,
-                    }
+                    let (vname, vals) = split2(arg);
+                    wrong_var = match lookup_var(vname, env) {
+                        Some(v) => !vals.split_whitespace().any(|w| w == v),
+                        None => true,
+                    };
                 }
                 "varnot" => {
-                    let mut tokens = arg.splitn(2, char::is_whitespace);
-                    let varname = tokens.next().unwrap_or("");
-                    let values = tokens.next().unwrap_or("").trim();
-                    match lookup_var(varname, env) {
-                        Some(val) => {
-                            wrong_var = values.split_whitespace().any(|v| v == val);
-                        }
-                        None => wrong_var = true,
-                    }
+                    let (vname, vals) = split2(arg);
+                    wrong_var = match lookup_var(vname, env) {
+                        Some(v) => vals.split_whitespace().any(|w| w == v),
+                        None => true,
+                    };
                 }
                 "endvar" => {
                     wrong_var = false;
                 }
                 "set" if !wrong_locale && !wrong_var => {
-                    let mut tokens = arg.splitn(2, char::is_whitespace);
-                    let varname = tokens.next().unwrap_or("");
-                    let value = tokens.next().unwrap_or("").trim();
-                    if lookup_var(varname, env).is_none() {
-                        env.insert(varname.to_owned(), value.to_owned());
+                    let (vname, val) = split2(arg);
+                    if lookup_var(vname, env).is_none() {
+                        env.insert(vname.to_owned(), val.to_owned());
                     }
                 }
-                "set" => {}
-                "message" | "prompt" => {}
-                "unitlist" => {
-                    if wrong_locale || wrong_var || (in_utf8 && utf8mode == 0) {
-                        continue;
+                "set" | "message" | "prompt" => {}
+                "unitlist" if !(wrong_locale || wrong_var || in_utf8 && utf8mode == 0) => {
+                    let (name, def) = split2(arg);
+                    if !name.is_empty() {
+                        ffi::newalias(name, def, linenum as c_int, file_ptr);
+                        results.push(Definition {
+                            name: name.to_owned(),
+                            definition: def.to_owned(),
+                            kind: DefinitionKind::Alias,
+                        });
                     }
-                    let mut tokens = arg.splitn(2, char::is_whitespace);
-                    let name = tokens.next().unwrap_or("");
-                    let def = tokens.next().unwrap_or("").trim();
-                    if name.is_empty() {
-                        continue;
-                    }
-                    ffi::newalias(name, def, *linenum as c_int, file_ptr);
-                    results.push(Definition {
-                        name: name.to_owned(),
-                        definition: def.to_owned(),
-                        kind: DefinitionKind::Alias,
-                    });
                 }
-                "include" => {
-                    if wrong_locale || wrong_var || (in_utf8 && utf8mode == 0) {
-                        continue;
-                    }
-                    let def = match arg {
-                        "elements.units" => {
-                            load_definitions_inner(units::ELEMENTS, c"elements.units", env)
-                        }
-                        #[cfg(feature = "currency-update")]
-                        "currency.units" => {
-                            load_definitions_inner(units::CURRENCY, c"currency.units", env)
-                        }
-                        #[cfg(feature = "currency-update")]
-                        "crypto.units" => {
-                            load_definitions_inner(units::CRYPTO, c"crypto.units", env)
-                        }
-                        #[cfg(feature = "currency-update")]
-                        "metal_prices.units" => {
-                            load_definitions_inner(units::METAL_PRICES, c"metal_prices.units", env)
-                        }
-                        #[cfg(feature = "currency-update")]
-                        "cpi.units" => load_definitions_inner(units::CPI, c"cpi.units", env),
-                        _ => vec![],
-                    };
-                    results.extend(def);
+                "unitlist" => {}
+                "include" if !(wrong_locale || wrong_var || in_utf8 && utf8mode == 0) => {
+                    results.extend(include_vendored(arg, env, utf8mode));
                 }
+                "include" => {}
                 _ => {}
             }
             continue;
@@ -319,47 +286,230 @@ fn load_definitions_inner(
             continue;
         }
 
-        let line = replace_operators(line);
-        let line = line.trim();
+        let norm = replace_operators(line);
+        let line = norm.trim();
         if line.is_empty() {
             continue;
         }
 
-        let mut tokens = line.splitn(2, char::is_whitespace);
-        let raw_name = tokens.next().unwrap_or("");
-        let def = tokens.next().unwrap_or("").trim();
-
+        let (raw_name, def) = split2(line);
         if raw_name == "-" || def.is_empty() {
             continue;
         }
+        let name = raw_name.strip_prefix('+').unwrap_or(raw_name);
+        if name.is_empty() {
+            continue;
+        }
 
+        let lnum = linenum as c_int;
+        if name.ends_with('-') {
+            ffi::newprefix(name, def, lnum, file_ptr);
+        } else if name.contains('[') {
+            ffi::newtable(name, def, lnum, file_ptr);
+        } else if name.contains('(') {
+            ffi::newfunction(name, def, lnum, file_ptr);
+        } else {
+            ffi::newunit(name, def, lnum, file_ptr);
+        }
+
+        results.push(Definition {
+            name: name.to_owned(),
+            definition: def.to_owned(),
+            kind: DefinitionKind::from_name(name),
+        });
+    }
+    results
+}
+
+#[cfg(feature = "vendored")]
+fn include_vendored(
+    arg: &str,
+    env: &mut HashMap<String, String>,
+    utf8mode: i32,
+) -> Vec<Definition> {
+    let (content, filename): (&str, &std::ffi::CStr) = match arg {
+        "elements.units" => (units::ELEMENTS, c"elements.units"),
+        #[cfg(feature = "currency-update")]
+        "currency.units" => (units::CURRENCY, c"currency.units"),
+        #[cfg(feature = "currency-update")]
+        "crypto.units" => (units::CRYPTO, c"crypto.units"),
+        #[cfg(feature = "currency-update")]
+        "metal_prices.units" => (units::METAL_PRICES, c"metal_prices.units"),
+        #[cfg(feature = "currency-update")]
+        "cpi.units" => (units::CPI, c"cpi.units"),
+        _ => return vec![],
+    };
+    let file_ptr = intern_filename(filename);
+    load_lines_vendored(content, env, file_ptr, utf8mode)
+}
+
+#[cfg(feature = "native")]
+fn load_core(
+    content: &str,
+    _filename: &std::ffi::CStr,
+    env: &mut HashMap<String, String>,
+    db: &mut Database,
+) -> Vec<Definition> {
+    let mut results = Vec::new();
+    let mut wrong_locale = false;
+    let mut in_utf8 = false;
+    let mut wrong_var = false;
+    const UTF8MODE: i32 = 1;
+
+    for (_linenum, raw_line) in join_continuations(content) {
+        let line = strip_comment(&raw_line);
+        let line = line.trim();
+
+        if let Some(rest) = line.strip_prefix('!') {
+            let (directive, arg) = split2(rest.trim());
+            match directive {
+                "locale" => {
+                    wrong_locale = arg != "en_US";
+                }
+                "endlocale" => {
+                    wrong_locale = false;
+                }
+                "utf8" => {
+                    in_utf8 = true;
+                }
+                "endutf8" => {
+                    in_utf8 = false;
+                }
+                "var" => {
+                    let (vname, vals) = split2(arg);
+                    wrong_var = match lookup_var(vname, env) {
+                        Some(v) => !vals.split_whitespace().any(|w| w == v),
+                        None => true,
+                    };
+                }
+                "varnot" => {
+                    let (vname, vals) = split2(arg);
+                    wrong_var = match lookup_var(vname, env) {
+                        Some(v) => vals.split_whitespace().any(|w| w == v),
+                        None => true,
+                    };
+                }
+                "endvar" => {
+                    wrong_var = false;
+                }
+                "set" if !wrong_locale && !wrong_var => {
+                    let (vname, val) = split2(arg);
+                    if lookup_var(vname, env).is_none() {
+                        env.insert(vname.to_owned(), val.to_owned());
+                    }
+                }
+                "set" | "message" | "prompt" => {}
+                "unitlist" if !(wrong_locale || wrong_var || in_utf8 && UTF8MODE == 0) => {
+                    let (name, def) = split2(arg);
+                    if !name.is_empty() {
+                        results.push(Definition {
+                            name: name.to_owned(),
+                            definition: def.to_owned(),
+                            kind: DefinitionKind::Alias,
+                        });
+                    }
+                }
+                "unitlist" => {}
+                "include" if !(wrong_locale || wrong_var || in_utf8 && UTF8MODE == 0) => {
+                    results.extend(include_native(arg, env, db));
+                }
+                "include" => {}
+                _ => {}
+            }
+            continue;
+        }
+
+        if wrong_locale || wrong_var || (in_utf8 && UTF8MODE == 0) {
+            continue;
+        }
+
+        let norm = replace_operators(line);
+        let line = norm.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let (raw_name, def) = split2(line);
+        if raw_name == "-" || def.is_empty() {
+            continue;
+        }
         let name = raw_name.strip_prefix('+').unwrap_or(raw_name);
         if name.is_empty() {
             continue;
         }
 
         match name {
-            n if n.ends_with('-') => ffi::newprefix(name, def, *linenum as c_int, file_ptr),
-            n if n.contains('[') => ffi::newtable(name, def, *linenum as c_int, file_ptr),
-            n if n.contains('(') => ffi::newfunction(name, def, *linenum as c_int, file_ptr),
-            _ => ffi::newunit(name, def, *linenum as c_int, file_ptr),
+            _ if name.ends_with('-') => db.insert_prefix(name, def),
+            _ if name.contains('[') => db.insert_table(name, def),
+            _ if name.contains('(') => db.insert_function(name, def),
+            _ => db.insert_unit(name, def),
         }
 
-        let kind = if name.ends_with('-') {
-            DefinitionKind::Prefix
-        } else if name.contains('[') {
-            DefinitionKind::Table
-        } else if name.contains('(') {
-            DefinitionKind::Function
-        } else {
-            DefinitionKind::Unit
-        };
         results.push(Definition {
             name: name.to_owned(),
             definition: def.to_owned(),
-            kind,
+            kind: DefinitionKind::from_name(name),
         });
     }
-
     results
+}
+
+#[cfg(feature = "native")]
+fn include_native(
+    arg: &str,
+    env: &mut HashMap<String, String>,
+    db: &mut Database,
+) -> Vec<Definition> {
+    let (content, _filename): (&str, &std::ffi::CStr) = match arg {
+        "elements.units" => (units::ELEMENTS, c"elements.units"),
+        #[cfg(feature = "currency-update")]
+        "currency.units" => (units::CURRENCY, c"currency.units"),
+        #[cfg(feature = "currency-update")]
+        "crypto.units" => (units::CRYPTO, c"crypto.units"),
+        #[cfg(feature = "currency-update")]
+        "metal_prices.units" => (units::METAL_PRICES, c"metal_prices.units"),
+        #[cfg(feature = "currency-update")]
+        "cpi.units" => (units::CPI, c"cpi.units"),
+        _ => return vec![],
+    };
+    load_core(content, c"", env, db)
+}
+
+fn join_continuations(content: &str) -> Vec<(usize, String)> {
+    let mut lines = Vec::new();
+    let mut iter = content.lines().enumerate();
+    while let Some((idx, line)) = iter.next() {
+        let line = if idx == 0 {
+            line.trim_start_matches('\u{FEFF}')
+        } else {
+            line
+        };
+        let mut buf = line.to_string();
+        while buf.ends_with('\\')
+            && let Some((_, next)) = iter.next()
+        {
+            buf.pop();
+            buf.push_str(next.trim_start());
+        }
+        lines.push((idx + 1, buf));
+    }
+    lines
+}
+
+fn strip_comment(line: &str) -> &str {
+    if let Some(pos) = line.find('#') {
+        return &line[..pos];
+    }
+    line
+}
+
+fn split2(s: &str) -> (&str, &str) {
+    let mut parts = s.splitn(2, char::is_whitespace);
+    let k = parts.next().unwrap_or("");
+    let v = parts.next().unwrap_or("").trim();
+    (k, v)
+}
+
+fn lookup_var(name: &str, env: &HashMap<String, String>) -> Option<String> {
+    env.get(name).cloned().or_else(|| std::env::var(name).ok())
 }

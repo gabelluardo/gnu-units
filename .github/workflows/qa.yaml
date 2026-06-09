@@ -27,10 +27,38 @@ jobs:
               with:
                   token: ${{ github.token }}
                   submodules: true
-            - name: Rust code sanity check
-              uses: canonical/desktop-engineering/gh-actions/rust/code-sanity@main
-              with:
-                  token: ${{ github.token }}
+            - name: Install Rust stable toolchain
+              run: rustup update stable
+            - name: Check formatting
+              run: cargo fmt --all -- --check
+            - name: Clippy
+              run: |
+                  set -euo pipefail
+                  combos=(
+                      ""
+                      "--features currency-update"
+                      "--no-default-features --features vendored"
+                      "--no-default-features --features vendored,currency-update"
+                  )
+                  for features in "${combos[@]}"; do
+                      echo "::group::clippy ${features:-(default)}"
+                      cargo clippy --workspace $features -- -D warnings
+                      echo "::endgroup::"
+                  done
+            - name: Clippy (tests)
+              run: |
+                  set -euo pipefail
+                  combos=(
+                      ""
+                      "--features currency-update"
+                      "--no-default-features --features vendored"
+                      "--no-default-features --features vendored,currency-update"
+                  )
+                  for features in "${combos[@]}"; do
+                      echo "::group::clippy --tests ${features:-(default)}"
+                      cargo clippy --workspace --tests $features -- -D warnings
+                      echo "::endgroup::"
+                  done
 
     rust-tests:
         name: "Rust: Tests and coverage"
@@ -47,8 +75,21 @@ jobs:
                   tool: nextest,cargo-llvm-cov
             - name: Install Rust stable toolchain
               run: rustup update stable
-            - name: Run tests
-              run: cargo nextest run --workspace
+            - name: Tests
+              run: |
+                  set -euo pipefail
+                  combos=(
+                      ""
+                      "--features currency-update"
+                      "--no-default-features --features vendored"
+                      "--no-default-features --features vendored,bindgen"
+                      "--no-default-features --features vendored,currency-update"
+                  )
+                  for features in "${combos[@]}"; do
+                      echo "::group::nextest ${features:-(default)}"
+                      cargo nextest run --workspace $features
+                      echo "::endgroup::"
+                  done
             - name: Collect coverage
               run: |
                   cargo llvm-cov nextest \
