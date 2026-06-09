@@ -460,7 +460,16 @@ fn fetch_exchangerate_api(
 ) -> Result<HashMap<String, f64>> {
     if let Some(key) = api_key {
         let url = format!("https://v6.exchangerate-api.com/v6/{}/latest/{}", key, base);
-        let response = client.get(url).send()?.error_for_status()?;
+        let response = client
+            .get(&url)
+            .send()
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| {
+                UpdateError::Provider(format!(
+                    "exchangerate-api request failed: {}",
+                    e.without_url()
+                ))
+            })?;
         let body: KeyedErApiResponse = response.json()?;
         return parse_keyed_er_response(body);
     }
